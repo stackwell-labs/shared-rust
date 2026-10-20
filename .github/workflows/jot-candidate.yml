@@ -150,7 +150,10 @@ jobs:
 
   journey:
     needs: [resolve, build]
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: ubuntu-latest began moving to 26.04 on
+    # 2026-10-19 and Playwright has no chromium build for it, so the install
+    # step below fails there. 24.04 is supported until 2029.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/create-github-app-token@v1
