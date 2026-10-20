@@ -97,7 +97,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: callers run Playwright here via extra-cmd
+    # (chirpauth/server-dev's developer journey), and ubuntu-latest began moving
+    # to 26.04 on 2026-10-19, where Playwright has no chromium build. 24.04 is
+    # supported until 2029.
+    runs-on: ubuntu-24.04
     # Measured over 607 runs (2026-07-15..08-25): median 4.2 min, p99 7.6, max 9.4
     # -- all with a WARM cache, which is what made 20 look like >2x headroom.
     #
