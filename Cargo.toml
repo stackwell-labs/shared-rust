@@ -38,7 +38,7 @@ axum-aws-lambda = "0.11"
 # second TLS stack rather than adding one.
 aws-config = { version = "1.8.8", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-dynamodb = { version = "1.95.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-chirp-auth-client = { git = "https://github.com/chirpauth/client-rust", tag = "v0.16.0" }
+chirp-auth-client = { git = "https://github.com/chirpauth/client-rust", tag = "v0.17.0" }
 uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
