@@ -691,8 +691,8 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chirp-auth-client"
-version = "0.16.0"
-source = "git+https://github.com/chirpauth/client-rust?tag=v0.16.0#7aecf2e36173b131378a8c82460b85170e4ae773"
+version = "0.17.0"
+source = "git+https://github.com/chirpauth/client-rust?tag=v0.17.0#5b5d7192b0b6b2629dfa84c5efd9b7ecb13a3481"
 dependencies = [
  "base64",
  "capability",
@@ -703,6 +703,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -906,7 +907,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1617,7 +1618,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1761,7 +1762,7 @@ dependencies = [
 
 [[package]]
 name = "platform-chirp-auth"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2414,7 +2415,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
