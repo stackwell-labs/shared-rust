@@ -331,11 +331,18 @@ pub struct VerifiedMachine {
 ///   verification failure (bad signature / iss / exp / environment / malformed).
 ///   Granite FALLS THROUGH to its end-user token path on this; the user path
 ///   produces the canonical 401 if it too rejects.
+/// - [`Unavailable`](Self::Unavailable) — the token could not be checked at all
+///   because ChirpAuth's JWKS could not be fetched (the lib's `JwksFetch`:
+///   transport error, timeout, a 429 throttle). This is NOT a verdict on the
+///   token, so it is neither a 401 nor fall-through-eligible: it is a 503.
+///   Folding it into `NotMachine` is what turned a throttled ChirpAuth into
+///   silent 401s for valid tokens.
 ///
-/// Drive and Spend-Core do not branch on the distinction — they collapse both to
-/// [`ApiError::Unauthorized`] via [`into_api_error`](Self::into_api_error),
-/// exactly the `.map_err(|_| Unauthorized)` they have today. Granite matches on
-/// the variant to reproduce its `None` / `Some(Err)` dispatch.
+/// Drive and Spend-Core do not branch on the token-verdict distinction — they
+/// collapse `Rejected`/`NotMachine` to [`ApiError::Unauthorized`] and
+/// `Unavailable` to [`ApiError::ServiceUnavailable`] via
+/// [`into_api_error`](Self::into_api_error) (or the `From` impl). Granite matches
+/// on the variant to reproduce its `None` / `Some(Err)` dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MachineAuthError {
     /// A verified machine token whose `client_id` is not allowlisted — a
@@ -344,19 +351,27 @@ pub enum MachineAuthError {
     /// Not a usable machine token for this issuer (human identity, or a
     /// verification failure) — a caller MAY fall through to another auth path.
     NotMachine,
+    /// The JWKS needed to verify the token could not be fetched — upstream
+    /// unavailable, not a bad token. Answer 503; do not fall through.
+    Unavailable,
 }
 
 impl MachineAuthError {
-    /// Collapse to [`ApiError::Unauthorized`] for consumers (Drive, Spend-Core)
-    /// that do not distinguish the two cases — both are a 401.
+    /// Map to the HTTP error: a token verdict (`Rejected`/`NotMachine`) is a 401,
+    /// an unreachable ChirpAuth (`Unavailable`) is a 503.
     pub fn into_api_error(self) -> ApiError {
-        ApiError::Unauthorized
+        match self {
+            Self::Rejected | Self::NotMachine => ApiError::Unauthorized,
+            Self::Unavailable => {
+                ApiError::ServiceUnavailable("authentication service unavailable".to_owned())
+            }
+        }
     }
 }
 
 impl From<MachineAuthError> for ApiError {
-    fn from(_: MachineAuthError) -> Self {
-        ApiError::Unauthorized
+    fn from(error: MachineAuthError) -> Self {
+        error.into_api_error()
     }
 }
 
@@ -458,15 +473,18 @@ impl MachineAuth {
     ///   verification failure (bad signature / iss / exp / environment /
     ///   malformed): the bearer is not a usable machine token for this issuer, so
     ///   a caller may fall through to another auth path.
+    /// - `Err(MachineAuthError::Unavailable)` — ChirpAuth's JWKS could not be
+    ///   fetched (the lib's `JwksFetch`), so the token was never checked: a 503,
+    ///   never fall-through-eligible.
     ///
     /// `client` is the caller's pooled `reqwest::Client` (the JWKS fetch reuses
     /// the connection pool); this crate does not own one.
     ///
-    /// Drive/Spend-Core treat both error variants as a flat 401 — they call
-    /// `.map_err(MachineAuthError::into_api_error)` (or rely on the `From` impl),
-    /// reproducing their current `.map_err(|_| Unauthorized)`. Granite matches on
-    /// the variant: `Rejected` → `Some(Err(Unauthorized))`, `NotMachine` →
-    /// `None` (fall through to the user-token path).
+    /// Drive/Spend-Core call `.map_err(MachineAuthError::into_api_error)` (or
+    /// rely on the `From` impl): `Rejected`/`NotMachine` → 401, `Unavailable` →
+    /// 503. Granite matches on the variant: `Rejected` →
+    /// `Some(Err(Unauthorized))`, `NotMachine` → `None` (fall through to the
+    /// user-token path), `Unavailable` → `Some(Err(ServiceUnavailable))`.
     pub async fn verify(
         &self,
         client: &reqwest::Client,
@@ -486,6 +504,11 @@ impl MachineAuth {
             // NOT be re-treated as a user token by a fall-through dispatcher.
             Err(chirp_auth_client::ChirpAuthError::MachineAudienceNotAccepted) => {
                 return Err(MachineAuthError::Rejected);
+            }
+            // The JWKS could not be fetched (ChirpAuth throttled / unreachable):
+            // no verdict on the token exists, so this is not NotMachine.
+            Err(chirp_auth_client::ChirpAuthError::JwksFetch(_)) => {
+                return Err(MachineAuthError::Unavailable);
             }
             // Any other verification failure (bad sig / iss / exp / env /
             // malformed). A human token from this issuer still verifies as
@@ -1053,5 +1076,43 @@ mod machine_auth_verify_tests {
             .expect_err("a non-allowlisted machine client is rejected");
         assert_eq!(err, MachineAuthError::Rejected);
         assert!(matches!(err.into_api_error(), ApiError::Unauthorized));
+    }
+
+    /// UPSTREAM UNAVAILABLE: when ChirpAuth's JWKS answers with API Gateway's
+    /// 429 throttle, a perfectly valid allowlisted machine token cannot be
+    /// checked. That is `Unavailable` → 503, never `NotMachine` → 401 (the
+    /// silent-401 failure mode this variant exists to end).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn throttled_jwks_is_unavailable_not_a_401() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jwks = format!("http://{}/jwks.json", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let body = r#"{"message":"Too Many Requests"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        let machine = machine_for(&jwks);
+        let iss = machine.issuer().to_owned();
+        let claims = format!(
+            r#"{{"iss":"{iss}","sub":"agent_xyz","aud":"{CLIENT_ID}","exp":{},"act":"machine","owner_sub":"sub_owner"}}"#,
+            now() + 3600
+        );
+        let err = machine
+            .verify(&reqwest::Client::new(), &make_jwt(&claims))
+            .await
+            .expect_err("an unfetchable JWKS cannot verify anything");
+        assert_eq!(err, MachineAuthError::Unavailable);
+        assert!(matches!(err.into_api_error(), ApiError::ServiceUnavailable(_)));
+        assert!(matches!(ApiError::from(err), ApiError::ServiceUnavailable(_)));
     }
 }
