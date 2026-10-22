@@ -181,7 +181,12 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm --prefix web ci
-      - run: cd web && npx playwright install --with-deps chromium
+      # The runner image's preinstalled Chrome, not `playwright install
+      # --with-deps`: that apt-installs fonts from Ubuntu's mirror on every run,
+      # and the same step stalled a chirp-auth run for 14 minutes on 2026-10-22.
+      # candidate-journey.mjs launches CHROME_PATH when set. A missing Chrome
+      # fails here, loudly.
+      - run: /usr/bin/google-chrome --version
       - run: mkdir -p web/dist && cp -R bins/jot-candidate-jot/web/. web/dist/
       - name: Run candidate acceptance
         env:
@@ -190,6 +195,7 @@ jobs:
           DRIVE_SERVICE_BIN: bins/jot-candidate-drive/drive-service
           JOT_JOURNEY_BIN: bins/jot-candidate-jot/journey_server
           JOT_JOURNEY_REVISIONS: bins/jot-candidate-revisions/revisions.json
+          CHROME_PATH: /usr/bin/google-chrome
         run: |
           set -euo pipefail
           for service in chirp granite drive jot; do
