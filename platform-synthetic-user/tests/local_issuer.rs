@@ -217,10 +217,11 @@ async fn synthetic_user_enrolls_signs_in_and_cannot_replay_a_counter() {
             body,
         }) => {
             eprintln!("stale counter refused at passkey finish: HTTP {status}: {body}");
-            // webauthn-rs's CredentialPossibleCompromise (counter <= stored),
-            // which ChirpAuth currently surfaces as a 500 with this text.
+            // A counter <= the stored one is the caller's assertion being
+            // refused: ChirpAuth answers 400 and names the counter.
+            assert_eq!(*status, 400, "refused as a client error: {body}");
             assert!(
-                body.contains("compromised"),
+                body.contains("signature counter did not advance"),
                 "refused for the counter: {body}"
             );
         }

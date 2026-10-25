@@ -27,7 +27,7 @@ permissions:
 env:
   # The chirp-auth revision the journey is proven against. Bump deliberately;
   # a failure after a bump means ChirpAuth's public flow changed.
-  CHIRP_AUTH_SHA: 0bd39099ea0c3ea358f0213efef56f6728f07b17
+  CHIRP_AUTH_SHA: d09cb5dacc45c02da0c698b158496a17f88ac868
 
 jobs:
   journey:
