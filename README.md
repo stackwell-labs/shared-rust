@@ -52,6 +52,12 @@ hostname that passed it can later resolve to 169.254.169.254. Extracted from
 chirp-auth's `messaging.rs`; granite previously carried a create-time-only
 denylist with no resolution at all.
 
+### `platform-synthetic-user`
+A real ChirpAuth account driven by a software passkey, for unattended live
+checks against production relying parties: a minimal ES256 WebAuthn
+authenticator with a write-ahead counter, and a browserless driver for
+ChirpAuth's public signup and PKCE sign-in flows. See its README.
+
 ## Building
 
 ```sh

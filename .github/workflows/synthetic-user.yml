@@ -1,0 +1,78 @@
+name: synthetic-user local issuer
+
+# The synthetic user against a REAL ChirpAuth: chirp-service built with
+# --features local-serve at a pinned revision and run as a hermetic local
+# issuer (in-memory store, generated keys, no call leaves the runner). The
+# self-test workflow builds this crate too, but there the journey test is
+# `#[ignore]`d because it needs the issuer binary; this is where it runs.
+#
+# Path-scoped so the chirp-auth build only happens when this crate (or this
+# file) changes. Same private-source pattern as jot-candidate.yml: the CI App
+# reads chirpauth/server-dev at an explicit SHA.
+on:
+  push:
+    branches: [main]
+    paths: ['platform-synthetic-user/**', '.github/workflows/synthetic-user.yml']
+  pull_request:
+    paths: ['platform-synthetic-user/**', '.github/workflows/synthetic-user.yml']
+  workflow_dispatch: {}
+
+concurrency:
+  group: synthetic-user-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The chirp-auth revision the journey is proven against. Bump deliberately;
+  # a failure after a bump means ChirpAuth's public flow changed.
+  CHIRP_AUTH_SHA: 0bd39099ea0c3ea358f0213efef56f6728f07b17
+
+jobs:
+  journey:
+    runs-on: ubuntu-latest
+    # A cold chirp-auth build is the long pole; this is a hang bound.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/create-github-app-token@v1
+        id: chirp
+        with:
+          app-id: ${{ vars.STACKWELL_CI_APP_ID }}
+          private-key: ${{ secrets.STACKWELL_CI_APP_PRIVATE_KEY }}
+          owner: chirpauth
+          repositories: server-dev
+      - uses: actions/create-github-app-token@v1
+        id: deps
+        with:
+          app-id: ${{ vars.STACKWELL_CI_APP_ID }}
+          private-key: ${{ secrets.STACKWELL_CI_APP_PRIVATE_KEY }}
+          owner: stackwell-labs
+      - uses: actions/checkout@v4
+        with:
+          repository: chirpauth/server-dev
+          ref: ${{ env.CHIRP_AUTH_SHA }}
+          path: chirp-auth
+          token: ${{ steps.chirp.outputs.token }}
+          persist-credentials: false
+      - name: verify checkout and authorize private dependencies
+        env:
+          DEPS_TOKEN: ${{ steps.deps.outputs.token }}
+        run: |
+          test "$(git -C chirp-auth rev-parse HEAD)" = "$CHIRP_AUTH_SHA"
+          git config --global url."https://x-access-token:${DEPS_TOKEN}@github.com/stackwell-labs/".insteadOf https://github.com/stackwell-labs/
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            chirp-auth -> target
+            . -> target
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - name: build the chirp-auth local issuer
+        working-directory: chirp-auth
+        run: cargo build --locked --bin chirp-service --features local-serve
+      - name: enroll, sign in, verify, refuse a stale counter
+        env:
+          CHIRP_AUTH_SERVICE_BIN: ${{ github.workspace }}/chirp-auth/target/debug/chirp-service
+        run: cargo test --locked -p platform-synthetic-user -- --include-ignored --nocapture

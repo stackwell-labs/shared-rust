@@ -1,0 +1,29 @@
+[package]
+name = "platform-synthetic-user"
+# Explicit version (not inherited) so this crate can advance independently.
+# 0.1.0: software passkey + plain-HTTP ChirpAuth enroll / sign-in driver,
+# proven against a local issuer only.
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A synthetic ChirpAuth user: a software WebAuthn passkey with a durably persisted counter, and a browserless driver for ChirpAuth's real signup and PKCE sign-in flows."
+
+[dependencies]
+# ES256 is the only algorithm the authenticator offers. RustCrypto, pure Rust,
+# no OpenSSL.
+p256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+getrandom = "0.2"
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+url = "2"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }
+# The integration test verifies issued ID tokens with the same verifier every
+# platform relying party uses, not with a hand-rolled check.
+chirp-auth-client = { workspace = true }
