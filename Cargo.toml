@@ -10,6 +10,7 @@ members = [
     "platform-sg-graph-client",
     "platform-notary",
     "platform-vault-dynamo",
+    "platform-synthetic-user",
 ]
 
 [workspace.package]
