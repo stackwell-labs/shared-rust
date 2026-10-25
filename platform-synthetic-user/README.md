@@ -68,3 +68,6 @@ cargo build --bin chirp-service --features local-serve
 CHIRP_AUTH_SERVICE_BIN=/path/to/target/debug/chirp-service \
   cargo test -p platform-synthetic-user -- --include-ignored --nocapture
 ```
+
+CI runs the same in `.github/workflows/synthetic-user.yml`, against a pinned
+chirp-auth revision.
