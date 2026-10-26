@@ -1,0 +1,91 @@
+# amber-ci jobs for shared-rust (spec: amber-ci docs/design.md §2; started
+# from templates/rust-lib.toml).
+#
+# They match .github/workflows/self-test.yml one for one. self-test calls
+# this repo's own rust-test.yml, whose two jobs become three here:
+#   rust-test.yml `test`: test-cmd + extra-cmd  -> test
+#                         clippy + rustfmt       -> lint  (continue-on-error there)
+#   rust-test.yml `audit` (audit-blocking unset) -> audit (non-blocking there)
+# What does not carry over: self-test also dogfoods rust-test.yml itself (a
+# change to the reusable workflow breaks here first). That is a property of
+# GitHub Actions YAML, so it stays on GitHub.
+#
+# Private git deps: store-core is the only private one, and the planner grants
+# every private dep Cargo.lock pins, so no job lists git_read.
+#
+# Hermetic reuse: every job runs `fetch` with the network, then `run` with
+# none. No source file include_str!s anything, so markdown and the workflow
+# YAML (read by no job here) are not inputs.
+
+version = 1
+
+[job.test]
+image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
+fetch = ["cargo fetch --locked"]
+run = [
+  # test-cmd. Doctests come along: platform-vault-dynamo's compile_fail
+  # invariants live there.
+  "cargo test --workspace --locked --offline --no-fail-fast",
+  # extra-cmd: features break consumers as easily as code (platform-chirp-auth's
+  # `testkit`). As on GitHub, it runs only once the tests pass.
+  "cargo check --workspace --all-features --locked --offline",
+]
+required_for_main = true
+reuse = true
+timeout_minutes = 40   # rust-test.yml's bound: a cold full-workspace compile
+cache = "rust-1.97.0"
+
+[job.test.inputs]
+exclude = ["**/*.md", ".github/**"]
+
+[job.test.env]
+CARGO_HOME = "/cache/cargo"
+CARGO_TARGET_DIR = "/cache/target"
+
+[job.lint]
+image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
+fetch = ["rustup component add clippy rustfmt", "cargo fetch --locked"]
+run = [
+  # Both run, as in rust-test.yml (two continue-on-error steps): a fmt
+  # failure must not hide clippy's findings. Fails if either fails.
+  "rc=0; cargo fmt --all --check || rc=1; cargo clippy --workspace --all-targets --locked --offline -- -D warnings || rc=1; exit $rc",
+]
+required_for_main = false   # continue-on-error in rust-test.yml
+reuse = true
+timeout_minutes = 30
+cache = "rust-1.97.0"
+
+[job.lint.inputs]
+exclude = ["**/*.md", ".github/**"]
+
+[job.lint.env]
+CARGO_HOME = "/cache/cargo"
+CARGO_TARGET_DIR = "/cache/target"
+
+[job.audit]
+image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
+# The advisory database is fetched with the tool, so the scan runs offline.
+# Its result depends on the lock and on time, hence `include` plus a
+# freshness bound (design §2, "Freshness").
+fetch = [
+  # From `/`, so no repo cargo config applies to the install.
+  "cd / && cargo install --locked cargo-audit --version 0.22.2",
+  "if [ -d /cache/advisory-db/.git ]; then git -C /cache/advisory-db pull -q --ff-only; else git clone -q https://github.com/rustsec/advisory-db /cache/advisory-db; fi",
+]
+run = [
+  # --no-yanked: the yanked check reads the live crates.io index, which run
+  # cannot reach (it printed one error per crate). rust-test.yml reports
+  # yanked crates only as warnings, so no failure is lost.
+  "cargo audit --no-fetch --no-yanked --db /cache/advisory-db --file Cargo.lock",
+]
+required_for_main = false   # self-test leaves audit-blocking at false
+reuse = true
+freshness = "24h"
+timeout_minutes = 20
+cache = "audit"
+
+[job.audit.inputs]
+include = ["Cargo.lock"]
+
+[job.audit.env]
+CARGO_HOME = "/cache/cargo"
