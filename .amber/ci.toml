@@ -5,7 +5,7 @@
 # this repo's own rust-test.yml, whose two jobs become three here:
 #   rust-test.yml `test`: test-cmd + extra-cmd  -> test
 #                         clippy + rustfmt       -> lint  (continue-on-error there)
-#   rust-test.yml `audit` (audit-blocking unset) -> audit (non-blocking there)
+#   rust-test.yml `audit` (audit-blocking: true) -> audit (blocking there)
 # What does not carry over: self-test also dogfoods rust-test.yml itself (a
 # change to the reusable workflow breaks here first). That is a property of
 # GitHub Actions YAML, so it stays on GitHub.
@@ -78,7 +78,7 @@ run = [
   # yanked crates only as warnings, so no failure is lost.
   "cargo audit --no-fetch --no-yanked --db /cache/advisory-db --file Cargo.lock",
 ]
-required_for_main = false   # self-test leaves audit-blocking at false
+required_for_main = true    # self-test sets audit-blocking: true
 reuse = true
 freshness = "24h"
 timeout_minutes = 20

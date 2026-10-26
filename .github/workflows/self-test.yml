@@ -46,4 +46,9 @@ jobs:
       # profiles of other repos turn on, so a default-features-only build can be
       # green while every consumer's test build is broken.
       extra-cmd: cargo check --workspace --all-features
+      # The lock is advisory-clean (justified ignores in .cargo/audit.toml), so
+      # a new advisory fails here instead of hiding behind continue-on-error.
+      # shared-rust is pinned by every service: an advisory left here is
+      # inherited by all of them.
+      audit-blocking: true
     secrets: inherit
