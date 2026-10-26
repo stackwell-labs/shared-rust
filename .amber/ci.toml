@@ -65,7 +65,7 @@ CARGO_TARGET_DIR = "/cache/target"
 [job.audit]
 image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
 # The advisory database is fetched with the tool, so the scan runs offline.
-# Its result depends on the lock and on time, hence `include` plus a
+# Its result depends on the lock, the ignore list and time, hence `include` plus a
 # freshness bound (design §2, "Freshness").
 fetch = [
   # From `/`, so no repo cargo config applies to the install.
@@ -85,7 +85,8 @@ timeout_minutes = 20
 cache = "audit"
 
 [job.audit.inputs]
-include = ["Cargo.lock"]
+# .cargo/audit.toml holds the justified ignores; cargo-audit reads it from cwd.
+include = ["Cargo.lock", ".cargo/audit.toml"]
 
 [job.audit.env]
 CARGO_HOME = "/cache/cargo"
