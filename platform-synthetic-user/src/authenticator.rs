@@ -354,7 +354,7 @@ fn cbor_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// COSE_Key for an ES256 public key: `{1: 2, 3: -7, -1: 1, -2: x, -3: y}`.
 fn cose_es256_key(key: &VerifyingKey) -> Vec<u8> {
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let (Some(x), Some(y)) = (point.x(), point.y()) else {
         unreachable!("an uncompressed P-256 point has both coordinates")
     };
