@@ -1,0 +1,13 @@
+# cargo-audit config. Every ignore needs: the advisory, why shared-rust is not
+# exposed, and a link. Ignore nothing that has not been analyzed; drop the entry
+# once a fixed release exists.
+
+[advisories]
+ignore = [
+  # rsa Marvin timing attack, no fixed release (https://rustsec.org/advisories/RUSTSEC-2023-0071).
+  # rsa is reached only via platform-chirp-auth's opt-in `testkit` feature and its
+  # tests: RS256 signing of test tokens with a throwaway in-process key, so there
+  # is no real private key to recover and no remote timing oracle. Production
+  # RS256 verification (chirp-auth-client) does not use the rsa crate.
+  "RUSTSEC-2023-0071",
+]
