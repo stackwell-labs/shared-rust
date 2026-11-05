@@ -5,7 +5,7 @@
 # this repo's own rust-test.yml, whose two jobs become three here:
 #   rust-test.yml `test`: test-cmd + extra-cmd  -> test
 #                         clippy + rustfmt       -> lint  (continue-on-error there)
-#   rust-test.yml `audit` (audit-blocking: true) -> audit (blocking there)
+#   rust-test.yml `audit` (audit-blocking: true) -> audit (nightly here; see it)
 # What does not carry over: self-test also dogfoods rust-test.yml itself (a
 # change to the reusable workflow breaks here first). That is a property of
 # GitHub Actions YAML, so it stays on GitHub.
@@ -64,29 +64,22 @@ CARGO_TARGET_DIR = "/cache/target"
 
 [job.audit]
 image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
-# The advisory database is fetched with the tool, so the scan runs offline.
-# Its result depends on the lock, the ignore list and time, hence `include` plus a
-# freshness bound (design §2, "Freshness").
-fetch = [
+# Nightly, not on every push (2026-11-05): an advisory published today must not
+# fail PRs that leave the dependencies alone. amber-ci has no "only when these
+# paths change" trigger, so the PR-time scan is rust-test.yml's (it runs on PRs
+# that change a lockfile, manifest or .cargo/audit.toml), and the daily scan
+# that pages is agent-platform--ops's dep-audit.yml. This one runs once a day on
+# main's newest commit when main has moved, and a failure reports neutral.
+# A nightly job cannot reuse, so it fetches the advisory database itself.
+run = [
   # From `/`, so no repo cargo config applies to the install.
   "cd / && cargo install --locked cargo-audit --version 0.22.2",
-  "if [ -d /cache/advisory-db/.git ]; then git -C /cache/advisory-db pull -q --ff-only; else git clone -q https://github.com/rustsec/advisory-db /cache/advisory-db; fi",
+  "cargo audit --file Cargo.lock",
 ]
-run = [
-  # --no-yanked: the yanked check reads the live crates.io index, which run
-  # cannot reach (it printed one error per crate). rust-test.yml reports
-  # yanked crates only as warnings, so no failure is lost.
-  "cargo audit --no-fetch --no-yanked --db /cache/advisory-db --file Cargo.lock",
-]
-required_for_main = true    # self-test sets audit-blocking: true
-reuse = true
-freshness = "24h"
+required_for_main = false   # a nightly job never gates main
+when = "nightly"
 timeout_minutes = 20
 cache = "audit"
-
-[job.audit.inputs]
-# .cargo/audit.toml holds the justified ignores; cargo-audit reads it from cwd.
-include = ["Cargo.lock", ".cargo/audit.toml"]
 
 [job.audit.env]
 CARGO_HOME = "/cache/cargo"

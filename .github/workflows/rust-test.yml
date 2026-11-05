@@ -94,6 +94,14 @@ on:
           required: false so the eight same-org callers using `secrets: inherit`
           are unaffected; inherit continues to populate it for them.
         required: false
+    outputs:
+      deps-changed:
+        description: >-
+          'true' when this run is a pull request that changes a lockfile, a
+          manifest or an audit ignore list (the `audit` job ran); empty
+          otherwise. For a caller with an audit of its own, such as
+          chirp-auth's quickstart, so it runs on the same PRs as this one.
+        value: ${{ jobs.deps-changed.outputs.changed }}
 
 jobs:
   test:
@@ -198,6 +206,53 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
         run: cargo fmt --all --check
 
+  # WHEN THE ADVISORY SCAN RUNS (2026-11-05): only on a pull request that changes
+  # a lockfile, a manifest or an audit ignore list. Never on a deploy (callers'
+  # deploy.yml reach this workflow through workflow_call on push, schedule or
+  # dispatch, where this job is skipped), never on a PR that leaves the
+  # dependencies alone.
+  #
+  # The scan's verdict depends on the date as well as on the tree. Run on every
+  # PR and deploy, one newly published advisory turned unrelated work red in
+  # every repo at once: 7 repos on 2026-10-24, and drive's test-plane deploy red
+  # every day from 2026-11-02 on pulldown-cmark RUSTSEC-2026-0433 (drive#1).
+  # A PR that does not touch dependencies cannot add an advisory, so scanning it
+  # tells that PR nothing it can act on.
+  #
+  # main is still scanned every day: agent-platform--ops's dep-audit.yml audits
+  # each caller's main and reports each one to Shriek as a dead-man's switch, so
+  # an advisory that stays open pages instead of waiting for the next lockfile
+  # PR. A caller added here belongs in that workflow's repo list too.
+  #
+  # A skipped job reports `skipped`, which land_amber.py, land_pr.py and GitHub
+  # required checks all accept, so a required `test / audit` still passes.
+  deps-changed:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      # A PR's checkout is its merge commit, whose first parent is the base
+      # branch's tip: HEAD^1..HEAD is exactly what the PR changes.
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: did the PR change a lockfile, manifest or audit ignore list?
+        id: diff
+        run: |
+          set -euo pipefail
+          files=$(git diff --name-only HEAD^1 HEAD)
+          deps=$(printf '%s\n' "$files" | grep -E '(^|/)(Cargo\.lock|Cargo\.toml|package-lock\.json|package\.json|\.cargo/audit\.toml)$' || true)
+          if [ -n "$deps" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            printf 'dependency files changed, auditing:\n%s\n' "$deps"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no lockfile, manifest or audit ignore list changed: audit skipped (main is audited daily)"
+          fi
+
   # Advisory scan runs as its OWN job, in parallel with `test`, so that installing
   # cargo-audit does not sit on the gate's critical path.
   #
@@ -236,6 +291,8 @@ jobs:
   # not this change. chirp-auth is the exception: it is already advisory-clean and
   # already gates on audit in its own hand-rolled workflow — that stays BLOCKING.
   audit:
+    needs: deps-changed
+    if: needs.deps-changed.outputs.changed == 'true'
     runs-on: ubuntu-latest
     # After the prebuilt install below this job is seconds, not minutes; 10 is a
     # hang bound, not a budget. Same reasoning as `test` above.
