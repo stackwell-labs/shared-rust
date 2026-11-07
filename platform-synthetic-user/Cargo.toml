@@ -3,7 +3,8 @@ name = "platform-synthetic-user"
 # Explicit version (not inherited) so this crate can advance independently.
 # 0.1.0: software passkey + plain-HTTP ChirpAuth enroll / sign-in driver,
 # proven against a local issuer only.
-version = "0.1.0"
+# 0.2.0: rotate_passkey, in place on the same account.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

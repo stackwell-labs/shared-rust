@@ -119,6 +119,11 @@ impl Credential {
         self.sign_count
     }
 
+    /// The account this credential answers for (the WebAuthn user handle).
+    pub(crate) fn user_handle(&self) -> &[u8] {
+        &self.user_handle
+    }
+
     fn signing_key(&self) -> Result<SigningKey, Error> {
         SigningKey::from_slice(&self.private_key)
             .map_err(|_| Error::State("stored private key is not a P-256 scalar".into()))
@@ -287,6 +292,16 @@ struct Descriptor {
 pub(crate) struct RequestOptions {
     #[serde(rename = "publicKey")]
     public_key: PublicKeyRequest,
+}
+
+impl RequestOptions {
+    /// Whether the ceremony names credential `id` in `allowCredentials`.
+    /// `None` when it names none (a discoverable request), which says
+    /// nothing about which credentials the account holds.
+    pub(crate) fn names(&self, id: &[u8]) -> Option<bool> {
+        let allow = &self.public_key.allow_credentials;
+        (!allow.is_empty()).then(|| allow.iter().any(|d| d.id == id))
+    }
 }
 
 #[derive(Debug, Deserialize)]

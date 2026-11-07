@@ -6,6 +6,12 @@
 //! never behind any counter the issuer has seen. Jot's live check saves the
 //! counter in a `finally`; write-ahead covers that case and a crash as well.
 //! [`UserState::next_assertion`] is the only way to obtain an assertion.
+//!
+//! **Rotation rule (write-ahead too).** A new key is saved, beside the one in
+//! use, before its registration is sent, and it replaces that key only once
+//! the issuer has accepted a sign-in from it. So at every point the store
+//! holds a key the account accepts, and a rotation cut short anywhere resumes
+//! from the store (see [`crate::SyntheticUser::rotate_passkey`]).
 
 use std::future::Future;
 use std::io::Write;
@@ -32,6 +38,35 @@ pub struct UserState {
     /// the account. [`crate::SyntheticUser::load`] refuses such a state.
     account: Option<Account>,
     credential: Credential,
+    /// `Some` while a passkey rotation is in progress. Absent from a state
+    /// that is not rotating, so such a state reads as it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rotation: Option<Rotation>,
+}
+
+/// A passkey rotation part way through.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub(crate) enum Rotation {
+    /// `next` was saved before its registration was sent, so the issuer may
+    /// or may not hold it. `credential` is still the key in use.
+    Registering {
+        next: Credential,
+        /// The issuer's id for the passkey being replaced.
+        retire: String,
+    },
+    /// `credential` is the new key, and the issuer has accepted a sign-in
+    /// from it. The old passkey `retire` is still on the account.
+    Retiring { retire: String },
+}
+
+/// Which of the state's keys signs an assertion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Key {
+    /// The key in use, [`UserState::credential`].
+    Current,
+    /// The new key of a rotation that is still registering.
+    Next,
 }
 
 /// What ChirpAuth's signup returned for this account.
@@ -50,6 +85,7 @@ impl std::fmt::Debug for UserState {
             .field("issuer", &self.issuer)
             .field("account_id", &self.account.as_ref().map(|a| &a.account_id))
             .field("credential", &self.credential)
+            .field("rotation", &self.rotation)
             .finish_non_exhaustive()
     }
 }
@@ -61,6 +97,7 @@ impl UserState {
             issuer: issuer.to_string(),
             account: None,
             credential,
+            rotation: None,
         }
     }
 
@@ -80,15 +117,82 @@ impl UserState {
         self.account = Some(account);
     }
 
-    /// Sign the next assertion and save the advanced counter **before**
-    /// returning it. If the save fails, the assertion is dropped unsent.
+    /// Whether a passkey rotation was started and has not finished. Running
+    /// [`crate::SyntheticUser::rotate_passkey`] again finishes it.
+    pub fn is_rotating(&self) -> bool {
+        self.rotation.is_some()
+    }
+
+    pub(crate) fn rotation(&self) -> Option<&Rotation> {
+        self.rotation.as_ref()
+    }
+
+    /// Start a rotation: hold `next` beside the key in use. The caller saves
+    /// this state before sending `next`'s registration.
+    pub(crate) fn begin_rotation(&mut self, next: Credential, retire: String) -> Result<(), Error> {
+        if self.rotation.is_some() {
+            return Err(Error::State("a rotation is already in progress".into()));
+        }
+        self.rotation = Some(Rotation::Registering { next, retire });
+        Ok(())
+    }
+
+    /// The issuer never registered `next` (its sign-in does not offer it):
+    /// drop it. The key in use is untouched.
+    pub(crate) fn abandon_rotation(&mut self) -> Result<(), Error> {
+        match self.rotation {
+            Some(Rotation::Registering { .. }) => {
+                self.rotation = None;
+                Ok(())
+            }
+            _ => Err(Error::State("no registering rotation to abandon".into())),
+        }
+    }
+
+    /// The issuer accepted a sign-in from `next`: it becomes the key in use.
+    pub(crate) fn promote_next(&mut self) -> Result<(), Error> {
+        match self.rotation.take() {
+            Some(Rotation::Registering { next, retire }) => {
+                self.credential = next;
+                self.rotation = Some(Rotation::Retiring { retire });
+                Ok(())
+            }
+            other => {
+                self.rotation = other;
+                Err(Error::State("no registering rotation to promote".into()))
+            }
+        }
+    }
+
+    /// The old passkey is gone from the account: the rotation is done.
+    pub(crate) fn finish_rotation(&mut self) -> Result<(), Error> {
+        match self.rotation {
+            Some(Rotation::Retiring { .. }) => {
+                self.rotation = None;
+                Ok(())
+            }
+            _ => Err(Error::State("no retiring rotation to finish".into())),
+        }
+    }
+
+    /// Sign the next assertion with `key` and save the advanced counter
+    /// **before** returning it. If the save fails, the assertion is dropped
+    /// unsent.
     pub(crate) async fn next_assertion<S: StateStore>(
         &mut self,
         store: &mut S,
+        key: Key,
         origin: &WebOrigin,
         options: &RequestOptions,
     ) -> Result<Value, Error> {
-        let assertion = self.credential.assert(origin, options)?;
+        let credential = match (key, &mut self.rotation) {
+            (Key::Current, _) => &mut self.credential,
+            (Key::Next, Some(Rotation::Registering { next, .. })) => next,
+            (Key::Next, _) => {
+                return Err(Error::State("no new key is registering".into()));
+            }
+        };
+        let assertion = credential.assert(origin, options)?;
         store.save(self).await?;
         Ok(assertion)
     }
@@ -229,14 +333,16 @@ mod tests {
             fail: false,
         };
         let a = state
-            .next_assertion(&mut store, &origin, &request())
+            .next_assertion(&mut store, Key::Current, &origin, &request())
             .await
             .unwrap();
         assert_eq!(store.saved, vec![1]);
         assert_eq!(counter_of(&a), 1);
 
         store.fail = true;
-        let refused = state.next_assertion(&mut store, &origin, &request()).await;
+        let refused = state
+            .next_assertion(&mut store, Key::Current, &origin, &request())
+            .await;
         assert!(
             refused.is_err(),
             "no assertion when the counter could not be saved"
@@ -245,7 +351,7 @@ mod tests {
         // The unsaved in-memory step is skipped, never reused.
         store.fail = false;
         let a = state
-            .next_assertion(&mut store, &origin, &request())
+            .next_assertion(&mut store, Key::Current, &origin, &request())
             .await
             .unwrap();
         assert_eq!(counter_of(&a), 3);
@@ -266,7 +372,7 @@ mod tests {
             recovery_codes: vec!["RC-SECRET-1".into()],
         });
         state
-            .next_assertion(&mut store, &origin, &request())
+            .next_assertion(&mut store, Key::Current, &origin, &request())
             .await
             .unwrap();
         let loaded = store.load().await.unwrap().unwrap();
@@ -283,6 +389,87 @@ mod tests {
         }
         assert!(!format!("{loaded:?}").contains("RC-SECRET-1"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_rotation_keeps_a_usable_key_at_every_step() {
+        let (mut state, origin) = enrolled();
+        let (next, _) = enrolled();
+        let old_id = state.credential.credential_id().to_vec();
+        let next_id = next.credential.credential_id().to_vec();
+        let mut store = Recording {
+            saved: vec![],
+            fail: false,
+        };
+        assert!(
+            state
+                .next_assertion(&mut store, Key::Next, &origin, &request())
+                .await
+                .is_err(),
+            "no new key before a rotation starts"
+        );
+
+        state
+            .begin_rotation(next.credential.clone(), "pk_old".into())
+            .unwrap();
+        assert!(state.is_rotating());
+        assert!(state
+            .begin_rotation(next.credential.clone(), "pk_old".into())
+            .is_err());
+        // Mid-registration the state still reads back, with both keys.
+        let read = UserState::from_json(&state.to_json().unwrap()).unwrap();
+        assert!(matches!(
+            read.rotation(),
+            Some(Rotation::Registering { next, retire })
+                if next.credential_id() == next_id && retire == "pk_old"
+        ));
+        assert_eq!(read.credential().credential_id(), old_id);
+
+        // The new key's counter is write-ahead too, and the old key is untouched.
+        let a = state
+            .next_assertion(&mut store, Key::Next, &origin, &request())
+            .await
+            .unwrap();
+        assert_eq!(counter_of(&a), 1);
+        assert_eq!(state.credential().sign_count(), 0);
+
+        state.promote_next().unwrap();
+        assert_eq!(state.credential().credential_id(), next_id);
+        assert_eq!(
+            state.credential().sign_count(),
+            1,
+            "promoted with its counter"
+        );
+        assert!(
+            matches!(state.rotation(), Some(Rotation::Retiring { retire }) if retire == "pk_old")
+        );
+        assert!(
+            state.abandon_rotation().is_err(),
+            "a proven key is never dropped"
+        );
+        assert!(state.promote_next().is_err());
+
+        state.finish_rotation().unwrap();
+        assert!(!state.is_rotating());
+        let value: Value = serde_json::from_slice(&state.to_json().unwrap()).unwrap();
+        assert!(
+            value.get("rotation").is_none(),
+            "a settled state has no rotation field"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_new_key_is_abandoned_for_the_old_one() {
+        let (mut state, _) = enrolled();
+        let (next, _) = enrolled();
+        let old_id = state.credential.credential_id().to_vec();
+        state
+            .begin_rotation(next.credential, "pk_old".into())
+            .unwrap();
+        state.abandon_rotation().unwrap();
+        assert!(!state.is_rotating());
+        assert_eq!(state.credential().credential_id(), old_id);
+        assert!(state.finish_rotation().is_err());
     }
 
     #[test]
