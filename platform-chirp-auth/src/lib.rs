@@ -51,13 +51,19 @@ pub use ids::{InvalidId, PairwiseSub, RootId};
 /// Machine-token clients for chirp's root-for-sub and operator-introspect
 /// routes (shared-rust#5).
 pub mod control;
-pub use control::{ConfigError, OperatorIntrospector, Resolved, RootResolver, Unavailable};
+pub use control::{OperatorIntrospector, Resolved, RootResolver, Unavailable};
 
 /// Hermetic test tokens (local mock JWKS + real RS256 signing) — the
 /// replacement for `decode_trusted_headers`' unauthenticated dev-bypass path
 /// in test suites. See the module doc for usage.
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+mod authenticator;
+pub use authenticator::{
+    env, AllowlistUnavailable, AuthFailure, Authenticator, Caller, ConfigError, MachineAllowlist,
+    Machines, Policy, TestIdentities,
+};
 
 // ---- Header name constants (single source of truth) --------------------
 
@@ -269,6 +275,85 @@ pub async fn apply_on_behalf_of_grant<S: GrantStore + ?Sized>(
     Ok(())
 }
 
+// ---- What a failed verification means ------------------------------------
+
+/// What a failed chirp verification says about the request: either a verdict
+/// on the token, or no verdict because ChirpAuth could not be reached.
+///
+/// This is the one classification of [`ChirpAuthError`] (shared-rust#3). Seven
+/// services used to map every `ChirpAuthError` to a 401, so a throttled or
+/// unreachable ChirpAuth told every caller with a valid token that their
+/// credential was bad. Convert with `?` (via `From`) and the outage is a 503:
+///
+/// ```ignore
+/// let verified = verify_chirp_id_token(&http, &config, token, options)
+///     .await
+///     .map_err(VerifyFailure::from)?; // ApiError: Invalid → 401, Unavailable → 503
+/// ```
+///
+/// The match in [`classify`](Self::classify) has no wildcard arm, so a
+/// variant a future chirp-auth-client adds fails to compile here and gets
+/// classified once, for every service, at the pin bump.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyFailure {
+    /// The token was checked and is not acceptable here (malformed, bad
+    /// signature, wrong issuer/audience/environment, expired, a machine token
+    /// this endpoint does not take). Answer 401.
+    Invalid,
+    /// The JWKS needed to check the token could not be fetched (transport
+    /// error, timeout, a 429 throttle, an unparseable body). Nothing is known
+    /// about the token. Answer 503, and never fall through to another
+    /// credential path as if the token had been refused.
+    Unavailable,
+}
+
+impl VerifyFailure {
+    /// Classify a verification error.
+    pub fn classify(error: &ChirpAuthError) -> Self {
+        match error {
+            ChirpAuthError::JwksFetch(_) => Self::Unavailable,
+            ChirpAuthError::MalformedToken
+            | ChirpAuthError::UnsupportedAlgorithm
+            | ChirpAuthError::NoMatchingKey
+            | ChirpAuthError::SignatureInvalid
+            | ChirpAuthError::ClaimMismatch
+            | ChirpAuthError::Expired
+            | ChirpAuthError::InvalidSubject
+            | ChirpAuthError::MachineNotAllowed
+            | ChirpAuthError::MachineAudienceNotAccepted
+            | ChirpAuthError::MalformedMachineToken
+            | ChirpAuthError::EnvironmentMismatch
+            | ChirpAuthError::MissingBearer
+            | ChirpAuthError::InvalidTokenType => Self::Invalid,
+        }
+    }
+}
+
+impl From<ChirpAuthError> for VerifyFailure {
+    fn from(error: ChirpAuthError) -> Self {
+        Self::classify(&error)
+    }
+}
+
+impl From<&ChirpAuthError> for VerifyFailure {
+    fn from(error: &ChirpAuthError) -> Self {
+        Self::classify(error)
+    }
+}
+
+/// The body every chirp-outage 503 carries. 5xx bodies are redacted by
+/// `platform-http-error` anyway; this is the internal message.
+const UNAVAILABLE_MESSAGE: &str = "authentication service unavailable";
+
+impl From<VerifyFailure> for ApiError {
+    fn from(failure: VerifyFailure) -> Self {
+        match failure {
+            VerifyFailure::Invalid => ApiError::Unauthorized,
+            VerifyFailure::Unavailable => ApiError::ServiceUnavailable(UNAVAILABLE_MESSAGE.to_owned()),
+        }
+    }
+}
+
 // ---- Shared chirp MACHINE-token verifier --------------------------------
 
 use std::collections::BTreeSet;
@@ -370,10 +455,8 @@ impl MachineAuthError {
     /// an unreachable ChirpAuth (`Unavailable`) is a 503.
     pub fn into_api_error(self) -> ApiError {
         match self {
-            Self::Rejected | Self::NotMachine => ApiError::Unauthorized,
-            Self::Unavailable => {
-                ApiError::ServiceUnavailable("authentication service unavailable".to_owned())
-            }
+            Self::Rejected | Self::NotMachine => VerifyFailure::Invalid.into(),
+            Self::Unavailable => VerifyFailure::Unavailable.into(),
         }
     }
 }
@@ -511,19 +594,23 @@ impl MachineAuth {
             // A machine token that verified but whose `client_id` is not in the
             // accepted set — the lib's definitive non-member rejection. This must
             // NOT be re-treated as a user token by a fall-through dispatcher.
-            Err(chirp_auth_client::ChirpAuthError::MachineAudienceNotAccepted) => {
+            Err(ChirpAuthError::MachineAudienceNotAccepted) => {
                 return Err(MachineAuthError::Rejected);
             }
-            // The JWKS could not be fetched (ChirpAuth throttled / unreachable):
-            // no verdict on the token exists, so this is not NotMachine.
-            Err(chirp_auth_client::ChirpAuthError::JwksFetch(_)) => {
-                return Err(MachineAuthError::Unavailable);
+            Err(error) => {
+                return Err(match VerifyFailure::classify(&error) {
+                    // The JWKS could not be fetched (ChirpAuth throttled /
+                    // unreachable): no verdict on the token exists, so this is
+                    // not NotMachine.
+                    VerifyFailure::Unavailable => MachineAuthError::Unavailable,
+                    // Any other verification failure (bad sig / iss / exp / env
+                    // / malformed). A human token from this issuer still
+                    // verifies as `Human` (handled below), so a hard error here
+                    // means the bearer is genuinely not a usable token for this
+                    // issuer — fall-through eligible.
+                    VerifyFailure::Invalid => MachineAuthError::NotMachine,
+                });
             }
-            // Any other verification failure (bad sig / iss / exp / env /
-            // malformed). A human token from this issuer still verifies as
-            // `Human` (handled below), so a hard error here means the bearer is
-            // genuinely not a usable token for this issuer — fall-through eligible.
-            Err(_) => return Err(MachineAuthError::NotMachine),
         };
         let environment = verified.environment;
         match verified.identity {
@@ -563,6 +650,26 @@ mod tests {
             );
         }
         h
+    }
+
+    #[test]
+    fn only_an_unfetchable_jwks_is_unavailable() {
+        let unavailable = ChirpAuthError::JwksFetch("429".into());
+        assert_eq!(VerifyFailure::from(&unavailable), VerifyFailure::Unavailable);
+        assert!(matches!(
+            ApiError::from(VerifyFailure::from(unavailable)),
+            ApiError::ServiceUnavailable(_)
+        ));
+        for verdict in [
+            ChirpAuthError::SignatureInvalid,
+            ChirpAuthError::Expired,
+            ChirpAuthError::MachineAudienceNotAccepted,
+            ChirpAuthError::EnvironmentMismatch,
+            ChirpAuthError::MissingBearer,
+        ] {
+            assert_eq!(VerifyFailure::from(&verdict), VerifyFailure::Invalid);
+            assert!(matches!(ApiError::from(VerifyFailure::from(verdict)), ApiError::Unauthorized));
+        }
     }
 
     #[test]

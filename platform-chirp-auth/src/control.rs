@@ -35,6 +35,7 @@ use platform_http_error::ApiError;
 use serde::Deserialize;
 
 use crate::ids::{PairwiseSub, RootId};
+use crate::ConfigError;
 
 /// The root-for-sub route, relative to the chirp base URL.
 pub const ROOT_FOR_SUB_PATH: &str = "/control/root-for-sub";
@@ -89,19 +90,6 @@ impl From<Unavailable> for ApiError {
         ApiError::ServiceUnavailable(format!("chirp {} unavailable", e.route))
     }
 }
-
-/// A chirp control client was built from settings it cannot work with. Meant
-/// to stop boot.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigError(String);
-
-impl fmt::Display for ConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for ConfigError {}
 
 /// What both clients share: where chirp is, whose machine token to present, and
 /// the HTTP client to send with (a service passes its UA-bearing one: chirp's

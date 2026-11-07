@@ -40,13 +40,20 @@ name = "platform-chirp-auth"
 # Repo tag v0.5.3 bumps the workspace chirp-auth-client dep v0.17.0 -> v0.18.0
 # (adds `verify_chirp_event`, chirp-auth#87), so a service that calls it builds
 # one copy of the client, not two. Nothing here changes shape.
-# 0.6.0 adds the shared `PairwiseSub`/`RootId` id types and the machine-token
-# `RootResolver`/`OperatorIntrospector` clients (shared-rust#5). Additive.
+# 0.6.0 (shared-rust#3) adds `VerifyFailure` (the one classification of
+# `ChirpAuthError`: a JWKS outage is a 503, everything else a 401), and
+# `Authenticator`: a typed `Policy` fixed at construction, `Caller`,
+# `AuthFailure`, an axum extractor and the `env` readers
+# (`{PREFIX}_CHIRP_ISSUER` / `_HUMAN_AUDIENCES` / `_MACHINE_CLIENTS`). The
+# testkit gains `Fixture::global()` (a JWKS issuer and a throttled one on a
+# long-lived thread) and `mint_test_id_token`. Additive; `MachineAuth` stays.
+# 0.6.0 also adds (shared-rust#5) the `PairwiseSub`/`RootId` id types and the
+# machine-token `RootResolver`/`OperatorIntrospector` clients. Additive.
 version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared chirp-auth glue: bearer extraction, dev trusted-header decoder, header constants, generic on-behalf-of grant resolution, pairwise/root id types, root-resolve and operator-introspect clients."
+description = "Shared chirp-auth glue: the bearer Authenticator, error classification, header constants, generic on-behalf-of grant resolution, pairwise/root id types, root-resolve and operator-introspect clients."
 
 [features]
 # Marker feature each backend forwards to gate ITS unauthenticated trusted-header
@@ -61,6 +68,7 @@ testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:base64", "dep:tokio"]
 
 [dependencies]
 http = { workspace = true }
+axum = { workspace = true }
 chirp-auth-client = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
@@ -77,6 +85,10 @@ tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tower = { workspace = true }
+# This crate with `testkit` on, so a plain `cargo test --workspace` (CI's
+# command) builds and runs the testkit and the Authenticator tests that use it.
+platform-chirp-auth = { path = ".", features = ["testkit"] }
 # Verify-path harness for the shared MachineAuth tests: mint real RS256 tokens
 # against a generated keypair and serve a JWKS from an in-process server, the
 # same approach chirp-auth-client's own verify-path tests use. The crypto path

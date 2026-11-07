@@ -34,6 +34,22 @@ redaction; gotta leaked anyhow chains. This crate ends that drift.
 
 ### `platform-chirp-auth`
 Shared chirp-auth request plumbing:
+- `Authenticator` — the one chirp bearer dispatcher. A `Policy` fixed at
+  construction says which humans (audiences), which machines
+  (`Machines::None | Allow | Any | Dynamic`) and whether test-keyset principals
+  (`TestIdentities`) are accepted; `authenticate(&headers)` returns a `Caller`
+  (`Human | Machine | Test`) or an `AuthFailure`. A ChirpAuth outage is a 503,
+  never a 401, and a rejected machine token is never retried as a human. `Caller`
+  is an axum extractor (state needs `Authenticator: FromRef<S>`). The `env`
+  readers use one naming scheme, `{PREFIX}_CHIRP_ISSUER`,
+  `{PREFIX}_HUMAN_AUDIENCES`, `{PREFIX}_MACHINE_CLIENTS`, and a missing or
+  blank one is a boot error.
+- `VerifyFailure` — the one classification of `ChirpAuthError`, for code that
+  calls the verifier itself: `JwksFetch` is `Unavailable` (503), all else
+  `Invalid` (401).
+- `testkit` (feature) — real RS256 tokens, and `Fixture::global()`: a local
+  issuer and a throttled (429) one on a thread that outlives each test's
+  runtime.
 - `bearer_token` — re-exported from `chirp-auth-client` (RFC-7235 extraction).
 - `decode_trusted_headers` — the dev/integration-test trusted-header decoder
   with the 128-char / no-control-char uid + agent-id validation, behind a
