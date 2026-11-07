@@ -148,7 +148,6 @@ jobs:
         run: |
           git config --global url."https://x-access-token:${GIT_TOKEN}@github.com/stackwell-labs/".insteadOf "https://github.com/stackwell-labs/"
       - name: cargo cache
-        id: cache
         uses: Swatinem/rust-cache@v2
         with:
           # Cache the dir that actually holds target/ — cache-workspaces when set
@@ -184,19 +183,32 @@ jobs:
       # Docker, Node and Java stay: callers run DynamoDB-Local and S3 in docker
       # and Playwright via extra-cmd.
       #
-      # Only on a cache miss, partial or total (`cache-hit` is 'true' only on
-      # an exact key match): those are the runs that rebuild much of the tree.
-      # A full hit rebuilds little, so paying that minute on every billed run
-      # buys nothing. Deleting in the background to overlap the cache restore
-      # was measured too, and was slower: the two contend for disk I/O.
-      - name: disk space (freed on a cache miss)
+      # Only when the disk left after the cache restore is under MIN_FREE_GB.
+      # Gating on a cache miss instead (shared-rust#14) was wrong: on
+      # 2026-11-07 compute-gateway#67 got a FULL hit with 8.2G free, its lib
+      # change relinked every test binary, and ld died of SIGBUS at 414M free
+      # (shared-rust#20). A full hit says nothing about how much a PR rebuilds;
+      # free space is the quantity that runs out, so measure that.
+      #
+      # 20G, from compute-gateway's runs that day on the private runner
+      # (72G disk): every restore left 8-9G free, and a build grew target by
+      # 9G (cold) or ran out past 7.8G (the relink). So private callers delete
+      # on nearly every run, which their disk needs. The public runner (84G
+      # free after restore) never does. Deleting in the background to overlap
+      # the cache restore was measured too, and was slower: the two contend for
+      # disk I/O.
+      - name: disk space (freed when under 20G)
         env:
-          FULL_HIT: ${{ steps.cache.outputs.cache-hit }}
+          MIN_FREE_GB: 20
         run: |
           df -h /
-          if [ "$FULL_HIT" != true ]; then
+          free_kb=$(df --output=avail -k / | tail -n 1 | tr -d ' ')
+          if [ "$free_kb" -lt $((MIN_FREE_GB * 1024 * 1024)) ]; then
+            echo "under ${MIN_FREE_GB}G free: deleting unused toolchains"
             time sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
             df -h /
+          else
+            echo "at least ${MIN_FREE_GB}G free: nothing to delete"
           fi
       - name: setup
         if: ${{ inputs.setup-cmd != '' }}
