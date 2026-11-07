@@ -83,6 +83,14 @@ instead of logging and dropping. A `Message` must name its `Priority`, and
 FCM's Doze-delayed NORMAL by omission. The `testkit` feature adds a fake FCM
 that verifies the signed assertion. See its README.
 
+### `platform-sg-graph-client`
+Social-Graph's graph-access protocol for third-party apps (gotta, porch):
+`resolve_me`, `register_membership` and `connections_members` from an opaque
+graph-access token. Every call reports SG rejecting the token (401/403) as
+`SgError::Rejected`, any other non-2xx as `SgError::Status`, and only a request
+that didn't complete as `SgError::Transport`, so an app maps one variant to its
+Unauthorized (shared-rust#16).
+
 ## Building
 
 ```sh
