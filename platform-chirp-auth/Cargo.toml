@@ -52,7 +52,12 @@ name = "platform-chirp-auth"
 # which return the authenticator's `ConfigError`. Additive. Repo tag v0.5.10
 # published 0.6.0 without them, and repo tag v0.6.0 carries them still numbered
 # 0.6.0; pin v0.6.1 or later for them.
-version = "0.6.1"
+# 0.6.2 (shared-rust#17, repo tag v0.6.2) re-exports `verify_chirp_event`,
+# `ChirpEvent` and `EventRejection`, and the `testkit` feature re-exports
+# chirp-auth-client's event-signing kit (`JwksServer`, `TestSigningKey`,
+# `user_deleted_claims`), so a deletion-webhook receiver drops its direct
+# chirp-auth-client dependency. Additive.
+version = "0.6.2"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -67,7 +72,9 @@ dev-trusted-headers = []
 # The hermetic-test-token module (`testkit`). Optional so a production
 # dependent never pulls in RSA keygen/signing; every service's `[dev-
 # dependencies]` entry for this crate should enable it.
-testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:base64", "dep:tokio"]
+# It also turns on chirp-auth-client's own `testkit` (the event-signing kit
+# that `testkit` re-exports, shared-rust#17).
+testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:base64", "dep:tokio", "chirp-auth-client/testkit"]
 
 [dependencies]
 http = { workspace = true }

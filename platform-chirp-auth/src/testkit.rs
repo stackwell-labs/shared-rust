@@ -35,6 +35,30 @@ use tokio::net::TcpListener;
 
 use crate::{ChirpAuthConfig, ID_TOKEN_TYP};
 
+/// ChirpAuth event tokens for a webhook receiver's tests (shared-rust#17):
+/// chirp-auth-client's own event-signing kit, re-exported so those tests need
+/// no direct chirp-auth-client dev-dependency. `JwksServer` serves the keys
+/// and is the events issuer; `TestSigningKey::sign_event` signs
+/// `user_deleted_claims` the way Chirp does, for `crate::verify_chirp_event`.
+///
+/// ```no_run
+/// # async fn example() {
+/// use platform_chirp_auth::testkit::{user_deleted_claims, JwksServer, TestSigningKey};
+/// use platform_chirp_auth::ChirpAuthConfig;
+///
+/// let key = TestSigningKey::new("event_test_1");
+/// let server = JwksServer::start(vec![key.jwk()]).await;
+/// let config = ChirpAuthConfig::new(server.issuer(), "cs_test_app");
+/// let now = std::time::SystemTime::now()
+///     .duration_since(std::time::UNIX_EPOCH)
+///     .unwrap()
+///     .as_secs() as i64;
+/// let token = key.sign_event(&user_deleted_claims(server.issuer(), "cs_test_app", "sub_1", "evt_1", now));
+/// # let _ = (config, token);
+/// # }
+/// ```
+pub use chirp_auth_client::testkit::{user_deleted_claims, JwksServer, TestSigningKey};
+
 /// The `kid` every testkit-minted token and the testkit JWKS agree on.
 pub const TEST_KID: &str = "platform-testkit-kid-1";
 

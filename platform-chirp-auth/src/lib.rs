@@ -43,6 +43,11 @@ pub use chirp_auth_client::{
 /// `MachineTokenMinter` / `MintConfig`), so a consumer that mints machine tokens
 /// (e.g. murmur) can also drop its direct chirp-auth-client dependency.
 pub use chirp_auth_client::mint;
+/// Re-export the ChirpAuth event verifier (chirp-auth#87), so a service that
+/// receives Chirp's `user.deleted` webhook needs no direct chirp-auth-client
+/// dependency either (shared-rust#17). The `testkit` feature carries the
+/// matching event-signing kit.
+pub use chirp_auth_client::{verify_chirp_event, ChirpEvent, EventRejection};
 
 /// The pairwise-sub and root-id types (shared-rust#5).
 pub mod ids;
