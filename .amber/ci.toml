@@ -21,7 +21,12 @@ version = 1
 
 [job.test]
 image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
-fetch = ["cargo fetch --locked"]
+fetch = [
+  # platform-secrets/tests/put_config_key.rs drives put-config-key.sh, which
+  # needs jq; the image has none (GitHub's ubuntu runner does).
+  "apt-get update -qq && apt-get install -y -qq --no-install-recommends jq",
+  "cargo fetch --locked",
+]
 run = [
   # test-cmd. Doctests come along: platform-vault-dynamo's compile_fail
   # invariants live there.
