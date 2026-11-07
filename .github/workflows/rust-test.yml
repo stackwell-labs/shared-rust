@@ -148,6 +148,7 @@ jobs:
         run: |
           git config --global url."https://x-access-token:${GIT_TOKEN}@github.com/stackwell-labs/".insteadOf "https://github.com/stackwell-labs/"
       - name: cargo cache
+        id: cache
         uses: Swatinem/rust-cache@v2
         with:
           # Cache the dir that actually holds target/ — cache-workspaces when set
@@ -170,6 +171,33 @@ jobs:
           # better than the state above, where the entry it would have reused was
           # being evicted anyway.
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      # The runner's disk is the build's real ceiling. On 2026-11-07
+      # compute-gateway#64 changed the lockfile enough to rebuild the aws-sdk
+      # tree next to the stale copies a partial rust-cache hit had restored
+      # (~817 MB compressed); GitHub warned "Free space left: 35 MB" and the
+      # linker died with SIGBUS, twice, on a commit that passes locally
+      # (shared-rust#14). Every caller is a private repo, on the small runner.
+      #
+      # The image ships toolchains no caller uses. Measured 2026-11-07, per
+      # directory: Android 11 GB in 84 s, .NET 6 GB in 14 s, GHCup 3 GB in 3 s,
+      # CodeQL 2 GB in 9 s; all of them together took 55 s in another run.
+      # Docker, Node and Java stay: callers run DynamoDB-Local and S3 in docker
+      # and Playwright via extra-cmd.
+      #
+      # Only on a cache miss, partial or total (`cache-hit` is 'true' only on
+      # an exact key match): those are the runs that rebuild much of the tree.
+      # A full hit rebuilds little, so paying that minute on every billed run
+      # buys nothing. Deleting in the background to overlap the cache restore
+      # was measured too, and was slower: the two contend for disk I/O.
+      - name: disk space (freed on a cache miss)
+        env:
+          FULL_HIT: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+          df -h /
+          if [ "$FULL_HIT" != true ]; then
+            time sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - name: setup
         if: ${{ inputs.setup-cmd != '' }}
         working-directory: ${{ inputs.working-directory }}
@@ -181,6 +209,13 @@ jobs:
         if: ${{ inputs.extra-cmd != '' }}
         working-directory: ${{ inputs.working-directory }}
         run: ${{ inputs.extra-cmd }}
+      # Runs even when the build failed, so a run that ran out of disk shows it
+      # instead of a bare linker crash.
+      - name: disk usage after build
+        if: ${{ always() }}
+        run: |
+          df -h /
+          du -sh "${{ inputs.cache-workspaces != '' && inputs.cache-workspaces || inputs.working-directory }}/target" || true
 
       # ---- quality floor: REPORTING ONLY -------------------------------------
       # No service on the platform is currently clippy- or rustfmt-clean (measured
