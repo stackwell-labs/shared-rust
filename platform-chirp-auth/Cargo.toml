@@ -47,9 +47,11 @@ name = "platform-chirp-auth"
 # (`{PREFIX}_CHIRP_ISSUER` / `_HUMAN_AUDIENCES` / `_MACHINE_CLIENTS`). The
 # testkit gains `Fixture::global()` (a JWKS issuer and a throttled one on a
 # long-lived thread) and `mint_test_id_token`. Additive; `MachineAuth` stays.
-# 0.6.0 also adds (shared-rust#5) the `PairwiseSub`/`RootId` id types and the
-# machine-token `RootResolver`/`OperatorIntrospector` clients. Additive.
-version = "0.6.0"
+# 0.6.1 (shared-rust#5, repo tag v0.5.11) adds the `PairwiseSub`/`RootId` id
+# types and the machine-token `RootResolver`/`OperatorIntrospector` clients,
+# which return the authenticator's `ConfigError`. Additive. (They landed after
+# repo tag v0.5.10 had already published 0.6.0 without them.)
+version = "0.6.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
