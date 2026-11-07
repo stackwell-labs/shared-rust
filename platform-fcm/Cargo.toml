@@ -9,9 +9,11 @@ description = "The one FCM HTTP v1 sender: service-account parsing, the RS256 OA
 [features]
 # The fake-FCM harness (`testkit`): a local OAuth token endpoint that verifies
 # the RS256 assertion, and a local FCM send endpoint that records messages and
-# answers per device. Optional so a production dependent never builds RSA
-# keygen or an HTTP server; a service's `[dev-dependencies]` entry enables it.
-testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:axum", "dep:tokio"]
+# answers per device. Optional so a production dependent never builds the
+# fixed test key or an HTTP server; a service's `[dev-dependencies]` entry
+# enables it. The fake verifies with `ring`, as production signs with it
+# (shared-rust#23), so the testkit needs no RSA crate of its own.
+testkit = ["dep:axum", "dep:tokio"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -20,9 +22,6 @@ reqwest = { workspace = true }
 ring = "0.17"
 serde_json = { workspace = true }
 # ── testkit's deps (optional; see the `testkit` feature) ────────────────────
-rsa = { version = "0.9", default-features = false, features = ["sha2", "std"], optional = true }
-sha2 = { version = "0.10", optional = true }
-rand = { version = "0.8", optional = true }
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 

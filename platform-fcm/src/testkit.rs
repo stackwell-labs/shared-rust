@@ -32,39 +32,61 @@ use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use rsa::pkcs1v15::{Signature, VerifyingKey};
-use rsa::pkcs8::EncodePrivateKey;
-use rsa::signature::Verifier;
-use rsa::{RsaPrivateKey, RsaPublicKey};
-use sha2::Sha256;
+use ring::signature::{KeyPair as _, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 
-use crate::{HttpV1Sender, ServiceAccount, FCM_SCOPE};
+use crate::{pkcs8_der_from_pem, HttpV1Sender, ServiceAccount, FCM_SCOPE};
 
 /// The fake service account's `client_email`.
 pub const CLIENT_EMAIL: &str = "fcm@fake-project.iam.gserviceaccount.com";
 /// The fake service account's `project_id`.
 pub const PROJECT_ID: &str = "fake-project";
 
-/// One RSA-2048 key per test process: keygen is the slow part.
-fn key() -> &'static RsaPrivateKey {
-    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| {
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("generate testkit RSA key")
-    })
-}
+/// The fake service account's RSA-2048 private key, PKCS#8 PEM. A fixed,
+/// public test key (shared-rust#23), as chirp-auth-client's testkit keys are:
+/// it signs only assertions this fake verifies, so it guards nothing. Inline
+/// rather than `include_str!`d, so no source file reads another (amber-ci's
+/// job inputs in `.amber/ci.toml` rely on that).
+const PRIVATE_KEY_PEM: &str = "\
+-----BEGIN PRIVATE KEY-----\n\
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDQbJWA3GepJMci\n\
+zF2J4MD6wRpJqL5gWiyuRmV3lrwGdTvnIUA4ABN72/VxlwKojtvwMiAF5HTGZ59e\n\
+hkmCOAZGueamJhnBVs/BbROylf2/P+GX+OnL+v30opF29rBl8m6rNpZ3ya0lLD/x\n\
+xbblesymqKNINo8lwskjjudpfk6TPe+31Rs33zU3sRuwpOgrBNcx3gind2EJi1o2\n\
+SmKDWyPkmOq5/kg43Zv6di1vy24eRl06OAGV/gaoLGb6Q2gc9z2W86WQoxgIbWOX\n\
+KXEO5WGIMld8Dre6JMdT5pQSvm1iNO5cXKpGBr1KwAnibSKntD4JmUk5q31GAYVk\n\
+1m5/M6JXAgMBAAECggEAZheqK9LKnBm9yZfdgbosDSglnksf5caF+F/XN/sH4wnt\n\
+68tnz4aKBLO7yIY18Sb5KPEEqp47bSw47m5M95JF0MMi7ePf3cqOPasWaPX7s4Cx\n\
+GmX878PkPb6cDm/L/EQCXa+BiO+q9nh0YhN9AW9ja4dTY/4FpHODXv2S8SPDjW94\n\
+zLP4gPldpoWqjYOkEyvQ7dqOIDD1J5O48Hp+75jfhZvd2GLBE717ywSUS8QmM+OW\n\
+3Fvi5U3xJu6v/r9y/MH4ol4pKKGLf251kZJMEoY+RsBzyxPXR0r7kF9xIAGqUuXE\n\
+x052MabbjEGJ8DiYCPnvQEp6qnk8y6ywEB5WWv7EQQKBgQDw1Kizg8B0axRyHhP6\n\
+Kh+IpNz52E5ZY5tknJ3LW/JG/ePPy4jZrZ3TsWYMbVE7EnIy/htqP7lCsqJB6Xgy\n\
+sZTMe76JWc/U3DTQSJa10ZerGFcvMjRGlKPMbbiBSIiy/a/x2tPIqsrVd9TUeUe+\n\
+KbuotxkD1R85VpxPwXQ3/Z4CkQKBgQDdjWB0GsEH5so8jPNSx5+HSNuDgNdcA9bJ\n\
+mE6bUOED1EqBXvWWbcldEjX7VcKkB56udCrCjLpzYIMOU5v4KDcIdgwsKDG6bssL\n\
+Z2Qhe6V1Y2jw6rADrajk3M9OtxzH7dM4NgmUPHCTedFu6MyFkvXaqtyPrSY2Zylm\n\
++n6pla/6ZwKBgQCCcv6KdmRJ6zKg+c/iYuy/zGVx5AvUeZLTdc43OC/M6nt6tAoF\n\
+tvhVkbLwKkqkz8ISAviAndHQ4gfn4fnco7ow5Rp5Na/Q4hKte5Q/Gi+oWr/m7a/J\n\
+R3xOIGSfitWY9rdWLy0mdfT2mjkreiI1TE+8/KjNHaUTHun+fZBhP7xWMQKBgHod\n\
+wetdD8amLBSB8GBRTZoIy43JR2sdZpdJjxJG2y/8JHD4gU9ABjx5nC2DkLxOwuUP\n\
+fL4tSVvs92+/H/oBWIweXQk9wmMrTFllzKgz+fghKieYhBoS70PufYm6nm+Io+KY\n\
+zmDZi4eOHqUORiTd4wt7IAVFgAl+hTCQo54ftpbDAoGAN93k7/SOUgs6+nTaPJ0e\n\
+bznhcygl53sZ9U8YvaXmcLIB3ChbrcbkWGwylwzZPUa2x0I66JTuN5St9Oup9o4H\n\
+ijGkp8weu9bZxTs3yqG85HzuOV2mwJ0XykAh61hPI8si6xVwPDqFYhuR15rA1eat\n\
+4xdGmidwTHlFHL/qNx1+na0=\n\
+-----END PRIVATE KEY-----\n\
+";
 
-fn private_key_pem() -> String {
-    let der = key().to_pkcs8_der().expect("encode testkit key as PKCS#8");
-    let b64 = STANDARD.encode(der.as_bytes());
-    let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
-    for line in b64.as_bytes().chunks(64) {
-        pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
-        pem.push('\n');
-    }
-    pem.push_str("-----END PRIVATE KEY-----\n");
-    pem
+/// The public half of [`PRIVATE_KEY_PEM`], as ring's PKCS#1 `RSAPublicKey` DER.
+fn public_key_der() -> &'static [u8] {
+    static DER: OnceLock<Vec<u8>> = OnceLock::new();
+    DER.get_or_init(|| {
+        let der = pkcs8_der_from_pem(PRIVATE_KEY_PEM).expect("testkit key is PEM");
+        let key = RsaKeyPair::from_pkcs8(&der).expect("testkit key is a PKCS#8 RSA key");
+        key.public_key().as_ref().to_vec()
+    })
 }
 
 /// One message the fake received.
@@ -123,7 +145,7 @@ impl FakeFcm {
             "type": "service_account",
             "project_id": PROJECT_ID,
             "client_email": CLIENT_EMAIL,
-            "private_key": private_key_pem(),
+            "private_key": PRIVATE_KEY_PEM,
             "token_uri": self.lock().token_uri,
         })
         .to_string()
@@ -235,9 +257,9 @@ fn check_assertion(assertion: &str, token_uri: &str) -> Result<(), String> {
     if header["alg"] != "RS256" {
         return Err(format!("alg is {}, not RS256", header["alg"]));
     }
-    let signature = Signature::try_from(decode(sig)?.as_slice()).map_err(|e| e.to_string())?;
+    let signature = decode(sig)?;
     let signing_input = &assertion[..assertion.rfind('.').expect("three parts")];
-    VerifyingKey::<Sha256>::new(RsaPublicKey::from(key()))
+    UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key_der())
         .verify(signing_input.as_bytes(), &signature)
         .map_err(|_| "signature does not verify".to_owned())?;
     let claims: serde_json::Value =
@@ -305,5 +327,48 @@ async fn send(
             StatusCode::OK,
             serde_json::json!({ "name": format!("projects/{PROJECT_ID}/messages/{n}") }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(token_uri: &str) -> ServiceAccount {
+        ServiceAccount::from_json(
+            &serde_json::json!({
+                "project_id": PROJECT_ID,
+                "client_email": CLIENT_EMAIL,
+                "private_key": PRIVATE_KEY_PEM,
+                "token_uri": token_uri,
+            })
+            .to_string(),
+        )
+        .expect("the testkit service account parses")
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+    }
+
+    /// The fixed key's own signature verifies, and a signature with one byte
+    /// changed does not: the fake really checks RS256, not just the claims.
+    #[test]
+    fn the_signature_is_checked_with_the_fixed_key() {
+        let uri = "http://fake/token";
+        let assertion = account(uri).assertion(now()).expect("sign");
+        assert_eq!(check_assertion(&assertion, uri), Ok(()));
+
+        let (signing_input, sig) = assertion.rsplit_once('.').expect("three parts");
+        let mut sig = URL_SAFE_NO_PAD.decode(sig).expect("base64url");
+        sig[0] ^= 1;
+        let tampered = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig));
+        assert_eq!(
+            check_assertion(&tampered, uri),
+            Err("signature does not verify".to_owned())
+        );
     }
 }
