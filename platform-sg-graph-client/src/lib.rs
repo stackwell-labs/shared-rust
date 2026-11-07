@@ -6,7 +6,7 @@
 //! porch had copy-pasted (and let drift) into their own `clients/social_graph.rs`:
 //!
 //! - [`SocialGraphClient::resolve_me`] — `GET /api/graph-access/me` → the caller's
-//!   per-app pseudonym ([`AppUserView`]); `None` on 401 (token rejected).
+//!   per-app pseudonym ([`AppUserView`]).
 //! - [`SocialGraphClient::register_membership`] — `POST /api/graph-access/membership`
 //!   → upsert the caller's graph-app membership (idempotent) so connections can
 //!   discover them.
@@ -18,6 +18,10 @@
 //! shaping (a plain pseudonym, or an environment-scoped identity built from
 //! [`AppUserView::environment`]) and error mapping. No global `users.id` is ever
 //! seen — SG mints a per-(app, user) pseudonym bound to the token server-side.
+//!
+//! Every call reports SG rejecting the token the same way, as
+//! [`SgError::Rejected`], so an app maps that one variant to its own
+//! Unauthorized and everything else to Internal (shared-rust#16).
 
 use serde::Deserialize;
 
@@ -44,20 +48,43 @@ struct Member {
 
 /// A graph-access call failed. Its own error type so any consumer maps it (an
 /// anyhow app via `?`, an app with its own `ApiError` via `.map_err`).
+///
+/// A consumer maps [`SgError::Rejected`] to its Unauthorized (the caller's
+/// token is bad: prompt a re-sign-in) and the other two to Internal (SG or the
+/// network failed).
 #[derive(Debug)]
 pub enum SgError {
-    /// The HTTP request failed to send, or a body failed to decode.
-    Transport(reqwest::Error),
-    /// SG returned an unexpected status (not 200, and not the 401 that
-    /// `resolve_me` maps to `Ok(None)`).
+    /// SG rejected the graph-access token (it answered 401 or 403, the status
+    /// carried here): expired, forged or revoked. The caller's auth failure,
+    /// not the app's.
+    Rejected(u16),
+    /// SG answered any other non-2xx status.
     Status(u16),
+    /// The request did not complete (it failed to send, or the response body
+    /// failed to read or decode). Never carries a status SG answered.
+    Transport(reqwest::Error),
+}
+
+impl SgError {
+    /// Classify a response by status: `Ok` on 2xx, else [`SgError::Rejected`]
+    /// for 401/403 and [`SgError::Status`] for the rest. The one place a status
+    /// becomes an error, so every call reports a rejected token the same way.
+    fn check(resp: reqwest::Response) -> Result<reqwest::Response, SgError> {
+        let status = resp.status();
+        match status.as_u16() {
+            _ if status.is_success() => Ok(resp),
+            code @ (401 | 403) => Err(SgError::Rejected(code)),
+            code => Err(SgError::Status(code)),
+        }
+    }
 }
 
 impl std::fmt::Display for SgError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SgError::Transport(e) => write!(f, "social-graph transport: {e}"),
+            SgError::Rejected(code) => write!(f, "social-graph rejected the token -> {code}"),
             SgError::Status(code) => write!(f, "social-graph -> {code}"),
+            SgError::Transport(e) => write!(f, "social-graph transport: {e}"),
         }
     }
 }
@@ -66,7 +93,7 @@ impl std::error::Error for SgError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             SgError::Transport(e) => Some(e),
-            SgError::Status(_) => None,
+            SgError::Rejected(_) | SgError::Status(_) => None,
         }
     }
 }
@@ -85,10 +112,9 @@ impl SocialGraphClient {
         }
     }
 
-    /// Resolve the graph-access token to the caller's [`AppUserView`]. `Ok(None)`
-    /// when SG rejects the token (401 → the caller maps to Unauthorized); any
-    /// other non-200 is an [`SgError::Status`].
-    pub async fn resolve_me(&self, token: &str) -> Result<Option<AppUserView>, SgError> {
+    /// Resolve the graph-access token to the caller's [`AppUserView`]. A token
+    /// SG rejects is [`SgError::Rejected`].
+    pub async fn resolve_me(&self, token: &str) -> Result<AppUserView, SgError> {
         let resp = self
             .http
             .get(format!("{}/api/graph-access/me", self.base_url))
@@ -96,11 +122,10 @@ impl SocialGraphClient {
             .send()
             .await
             .map_err(SgError::Transport)?;
-        match resp.status().as_u16() {
-            200 => Ok(Some(resp.json().await.map_err(SgError::Transport)?)),
-            401 => Ok(None),
-            other => Err(SgError::Status(other)),
-        }
+        SgError::check(resp)?
+            .json()
+            .await
+            .map_err(SgError::Transport)
     }
 
     /// Upsert the caller's graph-app membership (idempotent) so their connections
@@ -121,9 +146,8 @@ impl SocialGraphClient {
             }))
             .send()
             .await
-            .map_err(SgError::Transport)?
-            .error_for_status()
-            .map_err(SgError::Transport)?;
+            .map_err(SgError::Transport)
+            .and_then(SgError::check)?;
         Ok(())
     }
 
@@ -132,13 +156,15 @@ impl SocialGraphClient {
     pub async fn connections_members(&self, token: &str) -> Result<Vec<String>, SgError> {
         let members: Vec<Member> = self
             .http
-            .get(format!("{}/api/graph-access/connections/members", self.base_url))
+            .get(format!(
+                "{}/api/graph-access/connections/members",
+                self.base_url
+            ))
             .bearer_auth(token)
             .send()
             .await
-            .map_err(SgError::Transport)?
-            .error_for_status()
-            .map_err(SgError::Transport)?
+            .map_err(SgError::Transport)
+            .and_then(SgError::check)?
             .json()
             .await
             .map_err(SgError::Transport)?;
@@ -153,7 +179,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn resolve_me_returns_view_on_200_and_none_on_401() {
+    async fn resolve_me_returns_the_view_on_200() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/graph-access/me"))
@@ -164,19 +190,83 @@ mod tests {
             .mount(&server)
             .await;
         let c = SocialGraphClient::new(reqwest::Client::new(), server.uri());
-        let v = c.resolve_me("tok").await.unwrap().unwrap();
+        let v = c.resolve_me("tok").await.unwrap();
         assert_eq!(v.id, "psd_alice");
         assert_eq!(v.display_name.as_deref(), Some("Alice"));
         assert!(v.environment.is_none());
+    }
 
-        let server401 = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/graph-access/me"))
-            .respond_with(ResponseTemplate::new(401))
-            .mount(&server401)
+    /// A client against an SG whose every graph-access endpoint answers `status`.
+    async fn sg_answering(status: u16) -> (MockServer, SocialGraphClient) {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(status))
+            .mount(&server)
             .await;
-        let c401 = SocialGraphClient::new(reqwest::Client::new(), server401.uri());
-        assert!(c401.resolve_me("bad").await.unwrap().is_none());
+        let c = SocialGraphClient::new(reqwest::Client::new(), server.uri());
+        (server, c)
+    }
+
+    /// The error each of the three calls returns against an SG answering `status`.
+    async fn errors_on(status: u16) -> [(&'static str, SgError); 3] {
+        let (_s, c) = sg_answering(status).await;
+        [
+            ("resolve_me", c.resolve_me("t").await.unwrap_err()),
+            (
+                "register_membership",
+                c.register_membership("t", "psd", None).await.unwrap_err(),
+            ),
+            (
+                "connections_members",
+                c.connections_members("t").await.unwrap_err(),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_rejected_on_every_call() {
+        for status in [401, 403] {
+            for (call, e) in errors_on(status).await {
+                assert!(
+                    matches!(e, SgError::Rejected(code) if code == status),
+                    "{call} on {status}: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn any_other_failing_status_is_status_on_every_call() {
+        for status in [400, 404, 500, 503] {
+            for (call, e) in errors_on(status).await {
+                assert!(
+                    matches!(e, SgError::Status(code) if code == status),
+                    "{call} on {status}: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_sg_is_transport() {
+        // Bind then drop a listener so the port refuses connections.
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let c = SocialGraphClient::new(reqwest::Client::new(), format!("http://{addr}"));
+        assert!(matches!(
+            c.resolve_me("t").await,
+            Err(SgError::Transport(_))
+        ));
+        assert!(matches!(
+            c.connections_members("t").await,
+            Err(SgError::Transport(_))
+        ));
+        assert!(matches!(
+            c.register_membership("t", "psd", None).await,
+            Err(SgError::Transport(_))
+        ));
     }
 
     #[tokio::test]
@@ -206,6 +296,8 @@ mod tests {
             .mount(&server)
             .await;
         let c = SocialGraphClient::new(reqwest::Client::new(), server.uri());
-        c.register_membership("tok", "psd_bob", Some("Bob")).await.unwrap();
+        c.register_membership("tok", "psd_bob", Some("Bob"))
+            .await
+            .unwrap();
     }
 }
