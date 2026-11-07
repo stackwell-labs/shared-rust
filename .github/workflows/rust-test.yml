@@ -129,6 +129,20 @@ jobs:
     steps:
       - name: checkout
         uses: actions/checkout@v4
+      # The runner's disk is the build's real ceiling. On 2026-11-07
+      # compute-gateway#64 changed the lockfile enough to rebuild the aws-sdk
+      # tree next to the stale copies a partial rust-cache hit had restored
+      # (~817 MB compressed); GitHub warned "Free space left: 35 MB" and the
+      # linker died with SIGBUS, twice, on a commit that passes locally
+      # (shared-rust#14). The image ships toolchains no caller uses: .NET,
+      # Android, GHC and CodeQL. Removing them, before the cache is unpacked,
+      # gives every build that space back. Docker, Node and Java stay: callers
+      # run DynamoDB-Local and S3 in docker and Playwright via extra-cmd.
+      - name: free disk space
+        run: |
+          df -h /
+          time sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
       - name: install rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -181,6 +195,13 @@ jobs:
         if: ${{ inputs.extra-cmd != '' }}
         working-directory: ${{ inputs.working-directory }}
         run: ${{ inputs.extra-cmd }}
+      # Runs even when the build failed, so a run that ran out of disk shows it
+      # instead of a bare linker crash.
+      - name: disk usage after build
+        if: ${{ always() }}
+        run: |
+          df -h /
+          du -sh "${{ inputs.cache-workspaces != '' && inputs.cache-workspaces || inputs.working-directory }}/target" || true
 
       # ---- quality floor: REPORTING ONLY -------------------------------------
       # No service on the platform is currently clippy- or rustfmt-clean (measured
