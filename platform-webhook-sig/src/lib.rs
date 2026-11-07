@@ -124,7 +124,11 @@ pub enum VerifyError {
     /// HMAC mismatch — forged, tampered, or wrong secret.
     SignatureMismatch,
     /// Timestamp outside the freshness window. `skew_secs` is the absolute gap.
-    Stale { timestamp: i64, now: i64, skew_secs: i64 },
+    Stale {
+        timestamp: i64,
+        now: i64,
+        skew_secs: i64,
+    },
 }
 
 impl fmt::Display for VerifyError {
@@ -133,10 +137,18 @@ impl fmt::Display for VerifyError {
             VerifyError::MissingSignature => write!(f, "missing signature header"),
             VerifyError::MissingTimestamp => write!(f, "missing timestamp header"),
             VerifyError::MissingNonce => write!(f, "missing nonce header"),
-            VerifyError::MalformedSignature => write!(f, "malformed signature (expected sha256=<hex>)"),
-            VerifyError::MalformedTimestamp => write!(f, "malformed timestamp (expected integer seconds)"),
+            VerifyError::MalformedSignature => {
+                write!(f, "malformed signature (expected sha256=<hex>)")
+            }
+            VerifyError::MalformedTimestamp => {
+                write!(f, "malformed timestamp (expected integer seconds)")
+            }
             VerifyError::SignatureMismatch => write!(f, "signature mismatch"),
-            VerifyError::Stale { timestamp, now, skew_secs } => write!(
+            VerifyError::Stale {
+                timestamp,
+                now,
+                skew_secs,
+            } => write!(
                 f,
                 "stale delivery: timestamp {timestamp} is {skew_secs}s from now ({now})"
             ),
@@ -219,8 +231,7 @@ impl<'a> Verifier<'a> {
 
         // Constant-time compare via the MAC's own verifier, over the chosen
         // scheme's signed string.
-        let mut mac = HmacSha256::new_from_slice(self.secret)
-            .expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(self.secret).expect("HMAC accepts any key length");
         mac.update(timestamp.as_bytes());
         mac.update(b".");
         if scheme == Scheme::Canonical {
@@ -232,7 +243,9 @@ impl<'a> Verifier<'a> {
             .map_err(|_| VerifyError::SignatureMismatch)?;
 
         // Only after authenticity do we trust the timestamp value.
-        let ts: i64 = timestamp.parse().map_err(|_| VerifyError::MalformedTimestamp)?;
+        let ts: i64 = timestamp
+            .parse()
+            .map_err(|_| VerifyError::MalformedTimestamp)?;
         let skew = (now_unix - ts).abs();
         if skew > self.freshness_secs {
             return Err(VerifyError::Stale {
@@ -321,7 +334,9 @@ mod tests {
         let body = br#"{"event":"x"}"#;
         let signed = Signer::new(SECRET).sign(body);
         let now: i64 = signed.timestamp.parse().unwrap();
-        let v = Verifier::new(SECRET).verify(&present(&signed, body), now).unwrap();
+        let v = Verifier::new(SECRET)
+            .verify(&present(&signed, body), now)
+            .unwrap();
         assert_eq!(v.nonce, signed.nonce);
         assert_eq!(v.timestamp, now);
     }
@@ -380,10 +395,16 @@ mod tests {
         let base = Signer::new(SECRET).sign_with(body, "1000", "n");
         let mut p = present(&base, body);
         p.signature = None;
-        assert_eq!(v.verify(&p, 1000).unwrap_err(), VerifyError::MissingSignature);
+        assert_eq!(
+            v.verify(&p, 1000).unwrap_err(),
+            VerifyError::MissingSignature
+        );
         let mut p = present(&base, body);
         p.timestamp = None;
-        assert_eq!(v.verify(&p, 1000).unwrap_err(), VerifyError::MissingTimestamp);
+        assert_eq!(
+            v.verify(&p, 1000).unwrap_err(),
+            VerifyError::MissingTimestamp
+        );
         let mut p = present(&base, body);
         p.nonce = None;
         assert_eq!(v.verify(&p, 1000).unwrap_err(), VerifyError::MissingNonce);
@@ -395,9 +416,15 @@ mod tests {
         let signed = Signer::new(SECRET).sign_with(body, "1000", "n");
         let mut p = present(&signed, body);
         p.signature = Some("not-prefixed");
-        assert_eq!(Verifier::new(SECRET).verify(&p, 1000).unwrap_err(), VerifyError::MalformedSignature);
+        assert_eq!(
+            Verifier::new(SECRET).verify(&p, 1000).unwrap_err(),
+            VerifyError::MalformedSignature
+        );
         p.signature = Some("sha256=zzzz");
-        assert_eq!(Verifier::new(SECRET).verify(&p, 1000).unwrap_err(), VerifyError::MalformedSignature);
+        assert_eq!(
+            Verifier::new(SECRET).verify(&p, 1000).unwrap_err(),
+            VerifyError::MalformedSignature
+        );
     }
 
     #[test]

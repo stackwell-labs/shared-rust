@@ -69,17 +69,16 @@
 
 #![forbid(unsafe_code)]
 
-use aws_sdk_dynamodb::operation::{
-    batch_get_item::builders::BatchGetItemFluentBuilder,
-    describe_table::builders::DescribeTableFluentBuilder,
-    get_item::builders::GetItemFluentBuilder, put_item::builders::PutItemFluentBuilder,
-    query::builders::QueryFluentBuilder, scan::builders::ScanFluentBuilder,
-    update_item::builders::UpdateItemFluentBuilder,
-};
 use aws_sdk_dynamodb::config::http::HttpResponse;
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::transact_write_items::{
     TransactWriteItemsError, TransactWriteItemsOutput,
+};
+use aws_sdk_dynamodb::operation::{
+    batch_get_item::builders::BatchGetItemFluentBuilder,
+    describe_table::builders::DescribeTableFluentBuilder, get_item::builders::GetItemFluentBuilder,
+    put_item::builders::PutItemFluentBuilder, query::builders::QueryFluentBuilder,
+    scan::builders::ScanFluentBuilder, update_item::builders::UpdateItemFluentBuilder,
 };
 use aws_sdk_dynamodb::types::{ConditionCheck, Put, TransactWriteItem, Update};
 use aws_sdk_dynamodb::Client;

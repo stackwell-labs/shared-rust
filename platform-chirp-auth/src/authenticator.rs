@@ -184,7 +184,9 @@ pub enum AuthFailure {
 impl From<AuthFailure> for ApiError {
     fn from(failure: AuthFailure) -> Self {
         match failure {
-            AuthFailure::Unauthorized | AuthFailure::RejectedMachine => VerifyFailure::Invalid.into(),
+            AuthFailure::Unauthorized | AuthFailure::RejectedMachine => {
+                VerifyFailure::Invalid.into()
+            }
             AuthFailure::Unavailable => VerifyFailure::Unavailable.into(),
         }
     }
@@ -267,7 +269,9 @@ impl Authenticator {
             Some(audiences) => Some(non_empty(audiences, "the human audience set")?),
         };
         let machines = match policy.machines {
-            Machines::Allow(clients) => Machines::Allow(non_empty(clients, "the machine client set")?),
+            Machines::Allow(clients) => {
+                Machines::Allow(non_empty(clients, "the machine client set")?)
+            }
             other => other,
         };
         if humans.is_none() && matches!(machines, Machines::None) {
@@ -277,7 +281,9 @@ impl Authenticator {
         }
         let options = match &machines {
             Machines::None => VerifyOptions::default(),
-            Machines::Allow(clients) => VerifyOptions::accept_machine_clients(clients.iter().cloned()),
+            Machines::Allow(clients) => {
+                VerifyOptions::accept_machine_clients(clients.iter().cloned())
+            }
             Machines::Any | Machines::Dynamic(_) => {
                 let mut options = VerifyOptions::accept_machine_clients(std::iter::empty());
                 options.accept_any_machine_client = true;
@@ -435,7 +441,9 @@ where
     type Rejection = AuthFailure;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        Authenticator::from_ref(state).authenticate(&parts.headers).await
+        Authenticator::from_ref(state)
+            .authenticate(&parts.headers)
+            .await
     }
 }
 
