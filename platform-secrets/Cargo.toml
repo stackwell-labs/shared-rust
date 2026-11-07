@@ -1,0 +1,17 @@
+[package]
+name = "platform-secrets"
+# Explicit version (not inherited) so this crate advances independently.
+# 0.1.0: the one loader for protocols docs/adr-secret-storage.md (shared-rust#4).
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Read a service's secrets once at cold start from its one Secrets Manager JSON secret, into the service's own typed struct, with no secret value ever in an error or a log line."
+
+[dependencies]
+aws-config = { workspace = true }
+aws-sdk-secretsmanager = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = "2"
