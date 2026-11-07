@@ -3,8 +3,8 @@
 //! Every agent-platform backend (drive, pigeon, granite, bowerbird) defines a
 //! byte-identical `GET /health` returning `{"service": "<name>", "status":
 //! "ok"}`, plus a `/_service-info` carrying the same `{service, protocol,
-//! implementation_status, bind_addr, store}` core. These helpers are the single
-//! source of truth for those shapes.
+//! implementation_status, store}` core. These helpers are the single source of
+//! truth for those shapes.
 //!
 //! They are *value builders*, not axum handlers: a backend's handler stays a
 //! one-liner that wraps the returned struct in `axum::Json`, e.g.
@@ -72,33 +72,32 @@ impl Health {
 /// Services that need extra fields (e.g. drive's `default_limits`) should keep
 /// their own struct rather than contort this one; this captures the shape that
 /// is genuinely identical across services.
+///
+/// There is no `bind_addr`: the app is built before [`crate::serve`] binds, so
+/// a value here could only be the configured address (`127.0.0.1:0` on port 0,
+/// an unused default on Lambda, which binds nothing). The bound address is in
+/// `serve`'s `listening on <addr>` stdout line ([`crate::LISTENING_PREFIX`])
+/// (shared-rust#24).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServiceInfo {
     pub service: &'static str,
     pub protocol: &'static str,
     pub implementation_status: &'static str,
-    pub bind_addr: String,
     pub store: &'static str,
 }
 
 impl ServiceInfo {
     /// Build the standard service-info payload.
-    ///
-    /// `bind_addr` is taken as an owned `String` because it is derived from the
-    /// runtime-resolved socket address (`state.bind_addr.to_string()`), not a
-    /// compile-time constant like the other fields.
     pub fn new(
         service: &'static str,
         protocol: &'static str,
         implementation_status: &'static str,
-        bind_addr: String,
         store: &'static str,
     ) -> Self {
         Self {
             service,
             protocol,
             implementation_status,
-            bind_addr,
             store,
         }
     }
@@ -175,7 +174,6 @@ mod tests {
             "bowerbird",
             "Bowerbird static-site hosting",
             "site CRUD slice active; publish engine pending",
-            "127.0.0.1:8085".to_owned(),
             "memory",
         );
         let json = serde_json::to_value(info).unwrap();
@@ -185,7 +183,6 @@ mod tests {
                 "service": "bowerbird",
                 "protocol": "Bowerbird static-site hosting",
                 "implementation_status": "site CRUD slice active; publish engine pending",
-                "bind_addr": "127.0.0.1:8085",
                 "store": "memory"
             })
         );
