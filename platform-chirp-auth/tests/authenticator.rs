@@ -13,7 +13,7 @@ use platform_chirp_auth::testkit::{
 };
 use platform_chirp_auth::{
     env, AllowlistUnavailable, AuthFailure, Authenticator, Caller, Environment, MachineAllowlist,
-    Machines, Policy, TestIdentities,
+    Machines, Policy, TestIdentities, TestPrincipal,
 };
 use tower::ServiceExt as _;
 
@@ -58,10 +58,10 @@ async fn a_person_and_an_allowed_agent_are_callers() {
     assert_eq!(
         person,
         Ok(Caller::Human {
-            sub: "sub_alice".into(),
-            environment: Environment::Prod
+            sub: "sub_alice".into()
         })
     );
+    assert_eq!(person.unwrap().environment(), Environment::Prod);
 
     let agent = auth
         .verify(&mint_machine_id_token(fixture.issuer(), AGENT_CLIENT, "agent_1", "sub_alice"))
@@ -71,10 +71,10 @@ async fn a_person_and_an_allowed_agent_are_callers() {
         Ok(Caller::Machine {
             sub: "agent_1".into(),
             owner_sub: "sub_alice".into(),
-            client_id: AGENT_CLIENT.into(),
-            environment: Environment::Prod
+            client_id: AGENT_CLIENT.into()
         })
     );
+    assert_eq!(agent.unwrap().environment(), Environment::Prod);
 }
 
 #[tokio::test]
@@ -122,20 +122,76 @@ async fn a_test_principal_is_refused_unless_the_policy_accepts_it() {
     assert_eq!(refusing.verify(&token).await, Err(AuthFailure::Unauthorized));
 
     let accepting = Authenticator::new(policy(&issuer, Machines::None, TestIdentities::Accept)).unwrap();
+    let caller = accepting.verify(&token).await;
     assert_eq!(
-        accepting.verify(&token).await,
+        caller,
         Ok(Caller::Test {
-            sub: "sub_tester".into(),
-            environment: Environment::Test {
-                tenant: "tenant1".into()
+            tenant: "tenant1".into(),
+            principal: TestPrincipal::Human {
+                sub: "sub_tester".into()
             }
         })
+    );
+    assert_eq!(
+        caller.unwrap().environment(),
+        Environment::Test {
+            tenant: "tenant1".into()
+        }
     );
 
     // A production-keyset token never verifies at a test issuer, and the
     // reverse: the environment axis is the lib's.
     let prod_token = mint_human_id_token(&issuer, RP, "sub_alice");
     assert_eq!(accepting.verify(&prod_token).await, Err(AuthFailure::Unauthorized));
+}
+
+/// shared-rust#18: a machine token is a test principal when a test keyset
+/// verified it. Under `Reject` it is refused like a test person; under
+/// `Accept` it is a `Caller::Test`, never a `Caller::Machine`.
+#[tokio::test]
+async fn a_test_keyset_machine_is_a_test_principal() {
+    let fixture = Fixture::global();
+    let issuer = fixture.test_issuer("tenant1");
+    let agent = mint_machine_id_token(&issuer, AGENT_CLIENT, "agent_t", "sub_tester");
+    let machines = || Machines::Allow(set(&[AGENT_CLIENT]));
+
+    let refusing = Authenticator::new(policy(&issuer, machines(), TestIdentities::Reject)).unwrap();
+    assert_eq!(refusing.verify(&agent).await, Err(AuthFailure::Unauthorized));
+
+    let accepting = Authenticator::new(policy(&issuer, machines(), TestIdentities::Accept)).unwrap();
+    assert_eq!(
+        accepting.verify(&agent).await,
+        Ok(Caller::Test {
+            tenant: "tenant1".into(),
+            principal: TestPrincipal::Machine {
+                sub: "agent_t".into(),
+                owner_sub: "sub_tester".into(),
+                client_id: AGENT_CLIENT.into(),
+            }
+        })
+    );
+
+    // The machine policy still applies to a test machine.
+    let stranger = mint_machine_id_token(&issuer, "cs_stranger", "agent_s", "sub_tester");
+    assert_eq!(accepting.verify(&stranger).await, Err(AuthFailure::RejectedMachine));
+    let dynamic = |registry: Registry, test_identities| {
+        Authenticator::new(policy(&issuer, Machines::Dynamic(Arc::new(registry)), test_identities))
+            .unwrap()
+    };
+    let unlisted = dynamic(Registry(Ok(set(&["cs_someone_else"]))), TestIdentities::Accept);
+    assert_eq!(unlisted.verify(&agent).await, Err(AuthFailure::RejectedMachine));
+    let listed = dynamic(Registry(Ok(set(&[AGENT_CLIENT]))), TestIdentities::Accept);
+    assert!(matches!(
+        listed.verify(&agent).await,
+        Ok(Caller::Test {
+            principal: TestPrincipal::Machine { .. },
+            ..
+        })
+    ));
+    // Under Reject the allowlist is never asked: an outage there can't turn a
+    // refused test token into a 503.
+    let down = dynamic(Registry(Err(AllowlistUnavailable)), TestIdentities::Reject);
+    assert_eq!(down.verify(&agent).await, Err(AuthFailure::Unauthorized));
 }
 
 #[tokio::test]

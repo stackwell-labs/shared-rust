@@ -107,25 +107,30 @@ pub trait MachineAllowlist: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllowlistUnavailable;
 
-/// Whether a test-keyset principal ([`Caller::Test`]) is honoured.
+/// Whether a test-keyset principal ([`Caller::Test`]), person or machine, is
+/// honoured.
 ///
-/// A test principal only verifies against a `…/test/{tenant}` issuer, and it is
-/// kept apart from [`Caller::Human`] so a production surface cannot honour one
-/// by forgetting to check the environment. Accept it only once the service's
-/// stores are scoped by environment.
+/// A test principal only verifies against a `…/test/{tenant}` issuer. Which
+/// keyset verified a token decides it, not the token's kind: a machine token
+/// from a test keyset is a test principal too (shared-rust#18). It is kept
+/// apart from [`Caller::Human`] and [`Caller::Machine`] so a production
+/// surface cannot honour one by forgetting to check the environment. Accept it
+/// only once the service's stores are scoped by environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TestIdentities {
-    /// A test principal gets a 401.
+    /// Every token from a test keyset, person or machine, gets a 401.
     Reject,
-    /// A test principal is returned as [`Caller::Test`].
+    /// A test-keyset token is returned as [`Caller::Test`].
     Accept,
 }
 
-/// A verified chirp caller.
+/// A verified chirp caller. [`Human`](Self::Human) and
+/// [`Machine`](Self::Machine) were verified by the production keyset, by
+/// construction; anything a test keyset verified is [`Test`](Self::Test).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
     /// A person signed in to this service: their pairwise `sub`.
-    Human { sub: String, environment: Environment },
+    Human { sub: String },
     /// A confidential client: the agent `sub`, the person who registered the
     /// client (`owner_sub`), and the minting `client_id`, already checked
     /// against [`Machines`].
@@ -133,26 +138,55 @@ pub enum Caller {
         sub: String,
         owner_sub: String,
         client_id: String,
-        environment: Environment,
     },
-    /// A test-keyset principal. Only returned under [`TestIdentities::Accept`].
-    Test { sub: String, environment: Environment },
+    /// A principal from test tenant `tenant`'s keyset. Only returned under
+    /// [`TestIdentities::Accept`].
+    Test {
+        tenant: String,
+        principal: TestPrincipal,
+    },
+}
+
+/// Who a [`Caller::Test`] is: the same two kinds as production, held apart
+/// from them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TestPrincipal {
+    /// A test person: their `sub`.
+    Human { sub: String },
+    /// A test-keyset confidential client, already checked against [`Machines`]
+    /// like a production one.
+    Machine {
+        sub: String,
+        owner_sub: String,
+        client_id: String,
+    },
+}
+
+impl TestPrincipal {
+    /// The verified `sub`, whatever the variant.
+    pub fn sub(&self) -> &str {
+        match self {
+            Self::Human { sub } | Self::Machine { sub, .. } => sub,
+        }
+    }
 }
 
 impl Caller {
     /// The verified `sub`, whatever the variant.
     pub fn sub(&self) -> &str {
         match self {
-            Self::Human { sub, .. } | Self::Machine { sub, .. } | Self::Test { sub, .. } => sub,
+            Self::Human { sub } | Self::Machine { sub, .. } => sub,
+            Self::Test { principal, .. } => principal.sub(),
         }
     }
 
     /// Which ChirpAuth keyset verified the caller.
-    pub fn environment(&self) -> &Environment {
+    pub fn environment(&self) -> Environment {
         match self {
-            Self::Human { environment, .. }
-            | Self::Machine { environment, .. }
-            | Self::Test { environment, .. } => environment,
+            Self::Human { .. } | Self::Machine { .. } => Environment::Prod,
+            Self::Test { tenant, .. } => Environment::Test {
+                tenant: tenant.clone(),
+            },
         }
     }
 }
@@ -286,32 +320,64 @@ impl Authenticator {
                     VerifyFailure::Unavailable => AuthFailure::Unavailable,
                 },
             })?;
-        let environment = verified.environment;
-        match verified.identity {
-            ChirpVerifiedIdentity::Human { sub } => Ok(Caller::Human { sub, environment }),
-            ChirpVerifiedIdentity::Machine {
-                sub,
-                owner_sub,
-                client_id,
-            } => {
-                if let Machines::Dynamic(allowlist) = &inner.machines {
-                    match allowlist.allows(&client_id).await {
-                        Ok(true) => {}
-                        Ok(false) => return Err(AuthFailure::RejectedMachine),
-                        Err(AllowlistUnavailable) => return Err(AuthFailure::Unavailable),
-                    }
-                }
-                Ok(Caller::Machine {
+        // Test-ness is the verifying keyset's (provenance), never the token
+        // kind's: chirp-auth-client returns a test-keyset machine token as
+        // `Machine`, so it is decided here, before any principal is built.
+        match verified.environment {
+            Environment::Prod => match verified.identity {
+                ChirpVerifiedIdentity::Human { sub } => Ok(Caller::Human { sub }),
+                ChirpVerifiedIdentity::Machine {
                     sub,
                     owner_sub,
                     client_id,
-                    environment,
-                })
-            }
-            ChirpVerifiedIdentity::Test { sub } => match inner.test_identities {
-                TestIdentities::Reject => Err(AuthFailure::Unauthorized),
-                TestIdentities::Accept => Ok(Caller::Test { sub, environment }),
+                } => {
+                    self.admit_machine(&client_id).await?;
+                    Ok(Caller::Machine {
+                        sub,
+                        owner_sub,
+                        client_id,
+                    })
+                }
+                // chirp-auth-client builds `Test` only from a test keyset;
+                // refuse rather than trust a production one that claims it.
+                ChirpVerifiedIdentity::Test { .. } => Err(AuthFailure::Unauthorized),
             },
+            Environment::Test { tenant } => {
+                if inner.test_identities == TestIdentities::Reject {
+                    return Err(AuthFailure::Unauthorized);
+                }
+                let principal = match verified.identity {
+                    ChirpVerifiedIdentity::Human { sub } | ChirpVerifiedIdentity::Test { sub } => {
+                        TestPrincipal::Human { sub }
+                    }
+                    ChirpVerifiedIdentity::Machine {
+                        sub,
+                        owner_sub,
+                        client_id,
+                    } => {
+                        self.admit_machine(&client_id).await?;
+                        TestPrincipal::Machine {
+                            sub,
+                            owner_sub,
+                            client_id,
+                        }
+                    }
+                };
+                Ok(Caller::Test { tenant, principal })
+            }
+        }
+    }
+
+    /// The [`Machines::Dynamic`] check, made after the token verifies. The
+    /// other policies were already applied inside chirp-auth-client.
+    async fn admit_machine(&self, client_id: &str) -> Result<(), AuthFailure> {
+        let Machines::Dynamic(allowlist) = &self.inner.machines else {
+            return Ok(());
+        };
+        match allowlist.allows(client_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AuthFailure::RejectedMachine),
+            Err(AllowlistUnavailable) => Err(AuthFailure::Unavailable),
         }
     }
 }

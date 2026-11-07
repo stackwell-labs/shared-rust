@@ -57,7 +57,16 @@ name = "platform-chirp-auth"
 # chirp-auth-client's event-signing kit (`JwksServer`, `TestSigningKey`,
 # `user_deleted_claims`), so a deletion-webhook receiver drops its direct
 # chirp-auth-client dependency. Additive.
-version = "0.6.2"
+# 0.7.0 (shared-rust#18, repo tag v0.7.0) decides test-ness by the verifying
+# keyset, so `TestIdentities::Reject` refuses a test-keyset machine token too
+# (0.6 returned it as `Caller::Machine { environment: Test }`). BREAKING:
+# `Caller::Human`/`Machine` lose `environment` (they are production by
+# construction); `Caller::Test` is `{ tenant, principal: TestPrincipal }`, where
+# `TestPrincipal` is `Human { sub }` or `Machine { sub, owner_sub, client_id }`;
+# `Caller::environment()` returns an owned `Environment`. A service that took
+# test machines under `Reject` (model-gateway) switches to `Accept` and matches
+# `Caller::Test { principal: TestPrincipal::Machine { .. }, .. }`.
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

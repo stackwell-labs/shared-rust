@@ -38,7 +38,10 @@ Shared chirp-auth request plumbing:
   construction says which humans (audiences), which machines
   (`Machines::None | Allow | Any | Dynamic`) and whether test-keyset principals
   (`TestIdentities`) are accepted; `authenticate(&headers)` returns a `Caller`
-  (`Human | Machine | Test`) or an `AuthFailure`. A ChirpAuth outage is a 503,
+  or an `AuthFailure`. `Caller::Human` and `Caller::Machine` are production
+  callers by construction; anything a test keyset verified, person or machine,
+  is `Caller::Test { tenant, principal }`, so `TestIdentities::Reject` refuses
+  it all. A ChirpAuth outage is a 503,
   never a 401, and a rejected machine token is never retried as a human. `Caller`
   is an axum extractor (state needs `Authenticator: FromRef<S>`). The `env`
   readers use one naming scheme, `{PREFIX}_CHIRP_ISSUER`,
