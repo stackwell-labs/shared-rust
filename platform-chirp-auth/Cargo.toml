@@ -37,6 +37,9 @@ name = "platform-chirp-auth"
 # JWKS could not be fetched) mapped to a 503, instead of folding it into
 # `NotMachine` (a 401). BREAKING for an exhaustive match on the enum (Granite):
 # add an `Unavailable` arm that answers 503 and does not fall through.
+# Repo tag v0.5.3 bumps the workspace chirp-auth-client dep v0.17.0 -> v0.18.0
+# (adds `verify_chirp_event`, chirp-auth#87), so a service that calls it builds
+# one copy of the client, not two. Nothing here changes shape.
 version = "0.5.0"
 edition.workspace = true
 license.workspace = true

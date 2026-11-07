@@ -709,8 +709,8 @@ dependencies = [
 
 [[package]]
 name = "chirp-auth-client"
-version = "0.17.0"
-source = "git+https://github.com/chirpauth/client-rust?tag=v0.17.0#5b5d7192b0b6b2629dfa84c5efd9b7ecb13a3481"
+version = "0.18.0"
+source = "git+https://github.com/chirpauth/client-rust?tag=v0.18.0#069957ff3646e37dc2cbb62ccadd86288170c7c6"
 dependencies = [
  "base64",
  "capability",
