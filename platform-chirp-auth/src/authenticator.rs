@@ -10,9 +10,14 @@
 //! [`Authenticator`] owns those rules, and only it:
 //!
 //! - **What is accepted is a [`Policy`] fixed at construction:** human
-//!   audiences, which machine clients ([`Machines`]), and whether a test-keyset
-//!   principal is honoured ([`TestIdentities`]). [`Authenticator::new`] refuses a
-//!   policy that accepts nobody or names an empty set.
+//!   audiences, which machine clients ([`Machines`]), and which test tenants
+//!   the deployment serves beside its own issuer. [`Authenticator::new`]
+//!   refuses a policy that accepts nobody or names an empty set.
+//! - **The environment is decided here, once** (agent-platform--protocols#39):
+//!   each request gets its [`Plane`], `Prod` or `Test { tenant }`, from the
+//!   keyset that verified its token. The service picks its store handle (and
+//!   any downstream credentials) from the plane; [`Caller`] carries no
+//!   environment, so nothing below the handle sees one (shared-rust#19).
 //! - **One verify call per request.** chirp-auth-client checks a human token's
 //!   audience and a machine token's client in the same pass, so there is no
 //!   machine-then-human fall-through to get wrong, and a rejected machine token
@@ -25,47 +30,67 @@
 //! credential kinds it checks before or after the chirp bearer.
 //!
 //! ```ignore
-//! use platform_chirp_auth::{env, Authenticator, Machines, Policy, TestIdentities};
+//! use platform_chirp_auth::{env, Authenticated, Authenticator, Machines, Policy};
 //!
 //! let auth = Authenticator::new(Policy {
-//!     issuer: env::issuer("SPEND")?,
-//!     humans: Some(env::human_audiences("SPEND")?),
-//!     machines: Machines::Allow(env::machine_clients("SPEND")?),
-//!     test_identities: TestIdentities::Reject,
+//!     issuer: env::issuer("GRANITE")?,
+//!     humans: Some(env::human_audiences("GRANITE")?),
+//!     machines: Machines::Allow(env::machine_clients("GRANITE")?),
+//!     test_tenants: Some(["journeys".to_owned()].into()),
 //! })?;
-//! // In a handler: `caller: Caller` (the axum extractor, with
+//! // At boot: one store handle per `auth.planes()`.
+//! // In a handler: `Authenticated { caller, plane }` (the axum extractor, with
 //! // `Authenticator: FromRef<State>`), or `auth.authenticate(&headers).await?`.
 //! ```
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
 use axum::extract::{FromRef, FromRequestParts};
 use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use http::request::Parts;
 use platform_http_error::ApiError;
 
 use crate::{
-    bearer_token, verify_chirp_id_token, ChirpAuthConfig, ChirpAuthError, ChirpVerifiedIdentity,
-    Environment, VerifyFailure, VerifyOptions,
+    bearer_token, environment_from_issuer, verify_chirp_id_token, ChirpAuthConfig, ChirpAuthError,
+    ChirpVerifiedIdentity, Environment, VerifyFailure, VerifyOptions,
 };
 
+/// Which data plane a request belongs to: `Prod`, or `Test { tenant }` for a
+/// token one test tenant's keyset verified. A service picks its store handle
+/// (and the credentials it calls other services with) from it, and passes the
+/// handle down, never the plane (agent-platform--protocols#39).
+///
+/// Test is keyed by tenant: ChirpAuth lets every tenant mint any `test:` sub,
+/// so tenant `a`'s `test:alice` and tenant `b`'s are different people, on
+/// different planes.
+///
+/// The same type as [`Environment`] (one definition platform-wide,
+/// capability#2), named for what it is used for here.
+pub type Plane = Environment;
+
 /// Which chirp callers a service accepts. Every field is required, so each
-/// service states its machine and test-identity policy in its own code.
+/// service states its machine and test-tenant policy in its own code.
 #[derive(Clone, Debug)]
 pub struct Policy {
-    /// The ChirpAuth issuer. The JWKS URL derives from it
-    /// (`{issuer}/jwks.json`); a `…/test/{tenant}` issuer verifies that test
-    /// tenant's keyset instead of production's.
+    /// The deployment's ChirpAuth issuer. The JWKS URL derives from it
+    /// (`{issuer}/jwks.json`). Production's issuer is the [`Plane::Prod`]
+    /// plane; a `…/test/{tenant}` issuer makes a deployment that serves only
+    /// that tenant's [`Plane::Test`] plane.
     pub issuer: String,
     /// Audiences (this service's RP client ids) a human id_token may be minted
     /// for. `None`: no human token verifies here (a machine-only service).
     pub humans: Option<BTreeSet<String>>,
-    /// Which machine tokens are accepted.
+    /// Which machine tokens are accepted, on every plane.
     pub machines: Machines,
-    /// Whether a test-keyset principal is honoured.
-    pub test_identities: TestIdentities,
+    /// Test tenants served beside production, each verified against its own
+    /// keyset at `{issuer}/test/{tenant}`, so a token from any other tenant
+    /// gets a 401. `None`: only `issuer`'s plane. Declare one only once the
+    /// service has a store for its plane. Needs a production `issuer`.
+    pub test_tenants: Option<BTreeSet<String>>,
 }
 
 /// Which machine (`client_credentials`) tokens a service accepts, by the
@@ -107,26 +132,9 @@ pub trait MachineAllowlist: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllowlistUnavailable;
 
-/// Whether a test-keyset principal ([`Caller::Test`]), person or machine, is
-/// honoured.
-///
-/// A test principal only verifies against a `…/test/{tenant}` issuer. Which
-/// keyset verified a token decides it, not the token's kind: a machine token
-/// from a test keyset is a test principal too (shared-rust#18). It is kept
-/// apart from [`Caller::Human`] and [`Caller::Machine`] so a production
-/// surface cannot honour one by forgetting to check the environment. Accept it
-/// only once the service's stores are scoped by environment.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TestIdentities {
-    /// Every token from a test keyset, person or machine, gets a 401.
-    Reject,
-    /// A test-keyset token is returned as [`Caller::Test`].
-    Accept,
-}
-
-/// A verified chirp caller. [`Human`](Self::Human) and
-/// [`Machine`](Self::Machine) were verified by the production keyset, by
-/// construction; anything a test keyset verified is [`Test`](Self::Test).
+/// A verified chirp principal. Which plane it acts on is the [`Plane`] beside
+/// it in [`Authenticated`], not part of it: the same `sub` on two planes is two
+/// different callers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Caller {
     /// A person signed in to this service: their pairwise `sub`.
@@ -139,36 +147,6 @@ pub enum Caller {
         owner_sub: String,
         client_id: String,
     },
-    /// A principal from test tenant `tenant`'s keyset. Only returned under
-    /// [`TestIdentities::Accept`].
-    Test {
-        tenant: String,
-        principal: TestPrincipal,
-    },
-}
-
-/// Who a [`Caller::Test`] is: the same two kinds as production, held apart
-/// from them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TestPrincipal {
-    /// A test person: their `sub`.
-    Human { sub: String },
-    /// A test-keyset confidential client, already checked against [`Machines`]
-    /// like a production one.
-    Machine {
-        sub: String,
-        owner_sub: String,
-        client_id: String,
-    },
-}
-
-impl TestPrincipal {
-    /// The verified `sub`, whatever the variant.
-    pub fn sub(&self) -> &str {
-        match self {
-            Self::Human { sub } | Self::Machine { sub, .. } => sub,
-        }
-    }
 }
 
 impl Caller {
@@ -176,19 +154,17 @@ impl Caller {
     pub fn sub(&self) -> &str {
         match self {
             Self::Human { sub } | Self::Machine { sub, .. } => sub,
-            Self::Test { principal, .. } => principal.sub(),
         }
     }
+}
 
-    /// Which ChirpAuth keyset verified the caller.
-    pub fn environment(&self) -> Environment {
-        match self {
-            Self::Human { .. } | Self::Machine { .. } => Environment::Prod,
-            Self::Test { tenant, .. } => Environment::Test {
-                tenant: tenant.clone(),
-            },
-        }
-    }
+/// A verified request: who ([`Caller`]) and on which [`Plane`]. The plane is
+/// one of [`Authenticator::planes`], decided by the keyset that verified the
+/// token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Authenticated {
+    pub caller: Caller,
+    pub plane: Plane,
 }
 
 /// Why [`Authenticator::authenticate`] yielded no caller.
@@ -236,8 +212,8 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Verifies chirp bearers against one [`Policy`]. Cheap to clone (one `Arc`),
-/// so it can sit in axum state.
+/// Verifies chirp bearers against one [`Policy`], for each of its planes.
+/// Cheap to clone (one `Arc`), so it can sit in axum state.
 #[derive(Clone, Debug)]
 pub struct Authenticator {
     inner: Arc<Inner>,
@@ -245,21 +221,46 @@ pub struct Authenticator {
 
 #[derive(Debug)]
 struct Inner {
-    config: ChirpAuthConfig,
+    /// The deployment's issuer, normalized.
+    issuer: String,
+    /// One config per served plane, keyed by its normalized issuer.
+    configs: BTreeMap<String, ChirpAuthConfig>,
+    planes: Vec<Plane>,
     options: VerifyOptions,
     machines: Machines,
-    test_identities: TestIdentities,
     http: reqwest::Client,
 }
 
 impl Authenticator {
     /// Check `policy` and build the authenticator. Entries are trimmed. Refuses
-    /// a blank issuer, an empty audience or client set (say `None` instead), and
-    /// a policy accepting neither humans nor machines.
+    /// a blank issuer, an empty audience, client or tenant set (say `None`
+    /// instead), a policy accepting neither humans nor machines, a tenant that
+    /// is not one path segment, and test tenants beside a test issuer.
     pub fn new(policy: Policy) -> Result<Self, ConfigError> {
-        let issuer = policy.issuer.trim().to_owned();
+        let issuer = policy.issuer.trim().trim_end_matches('/').to_owned();
         if issuer.is_empty() {
             return Err(ConfigError("the chirp issuer is blank".to_owned()));
+        }
+        let mut issuers = vec![issuer.clone()];
+        if let Some(tenants) = policy.test_tenants {
+            if let Environment::Test { tenant } = environment_from_issuer(&issuer) {
+                return Err(ConfigError(format!(
+                    "{issuer} is test tenant {tenant}'s issuer; test tenants need the production issuer"
+                )));
+            }
+            for tenant in non_empty(tenants, "the test tenant set")? {
+                let test_issuer = format!("{issuer}/test/{tenant}");
+                if environment_from_issuer(&test_issuer)
+                    != (Environment::Test {
+                        tenant: tenant.clone(),
+                    })
+                {
+                    return Err(ConfigError(format!(
+                        "test tenant {tenant:?} is not a single path segment"
+                    )));
+                }
+                issuers.push(test_issuer);
+            }
         }
         let humans = match policy.humans {
             None => None,
@@ -284,34 +285,58 @@ impl Authenticator {
             }
         };
         // No human audience: an empty set, which no human id_token matches.
-        let config = ChirpAuthConfig::with_audiences(issuer, humans.into_iter().flatten());
+        let audiences: Vec<String> = humans.into_iter().flatten().collect();
+        let configs: BTreeMap<String, ChirpAuthConfig> = issuers
+            .into_iter()
+            .map(|issuer| {
+                let config = ChirpAuthConfig::with_audiences(issuer, audiences.iter().cloned());
+                (config.issuer().to_owned(), config)
+            })
+            .collect();
+        let planes = configs.values().map(ChirpAuthConfig::environment).collect();
         Ok(Self {
             inner: Arc::new(Inner {
-                config,
+                issuer,
+                configs,
+                planes,
                 options,
                 machines,
-                test_identities: policy.test_identities,
                 http: reqwest::Client::new(),
             }),
         })
     }
 
-    /// The normalized issuer tokens are verified against.
+    /// The deployment's normalized issuer ([`Policy::issuer`]).
     pub fn issuer(&self) -> &str {
-        self.inner.config.issuer()
+        &self.inner.issuer
+    }
+
+    /// Every plane a request can be on: the issuer's, then each declared test
+    /// tenant's. Build one store handle for each at boot.
+    pub fn planes(&self) -> &[Plane] {
+        &self.inner.planes
     }
 
     /// Authenticate the request's `Authorization: Bearer` token. No bearer is
     /// [`AuthFailure::Unauthorized`].
-    pub async fn authenticate(&self, headers: &http::HeaderMap) -> Result<Caller, AuthFailure> {
+    pub async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+    ) -> Result<Authenticated, AuthFailure> {
         let token = bearer_token(headers).ok_or(AuthFailure::Unauthorized)?;
         self.verify(token).await
     }
 
     /// Verify a bearer token already taken from the request.
-    pub async fn verify(&self, token: &str) -> Result<Caller, AuthFailure> {
+    pub async fn verify(&self, token: &str) -> Result<Authenticated, AuthFailure> {
         let inner = &*self.inner;
-        let verified = verify_chirp_id_token(&inner.http, &inner.config, token, inner.options.clone())
+        // The token's unverified `iss` only picks which keyset to try; that
+        // keyset's signature check, and the `iss` check against it, decide.
+        // An issuer this deployment does not serve is never fetched.
+        let config = unverified_issuer(token)
+            .and_then(|issuer| inner.configs.get(&issuer))
+            .ok_or(AuthFailure::Unauthorized)?;
+        let verified = verify_chirp_id_token(&inner.http, config, token, inner.options.clone())
             .await
             .map_err(|error| match error {
                 ChirpAuthError::MachineAudienceNotAccepted => AuthFailure::RejectedMachine,
@@ -320,52 +345,40 @@ impl Authenticator {
                     VerifyFailure::Unavailable => AuthFailure::Unavailable,
                 },
             })?;
-        // Test-ness is the verifying keyset's (provenance), never the token
+        // The plane is the verifying keyset's (provenance), never the token
         // kind's: chirp-auth-client returns a test-keyset machine token as
-        // `Machine`, so it is decided here, before any principal is built.
-        match verified.environment {
-            Environment::Prod => match verified.identity {
-                ChirpVerifiedIdentity::Human { sub } => Ok(Caller::Human { sub }),
+        // `Machine`, with a test environment.
+        let caller = match (&verified.environment, verified.identity) {
+            (Environment::Prod, ChirpVerifiedIdentity::Human { sub }) => Caller::Human { sub },
+            // chirp-auth-client builds `Test` only from a test keyset; refuse
+            // rather than trust a production one that claims it.
+            (Environment::Prod, ChirpVerifiedIdentity::Test { .. }) => {
+                return Err(AuthFailure::Unauthorized)
+            }
+            (
+                Environment::Test { .. },
+                ChirpVerifiedIdentity::Human { sub } | ChirpVerifiedIdentity::Test { sub },
+            ) => Caller::Human { sub },
+            (
+                _,
                 ChirpVerifiedIdentity::Machine {
                     sub,
                     owner_sub,
                     client_id,
-                } => {
-                    self.admit_machine(&client_id).await?;
-                    Ok(Caller::Machine {
-                        sub,
-                        owner_sub,
-                        client_id,
-                    })
+                },
+            ) => {
+                self.admit_machine(&client_id).await?;
+                Caller::Machine {
+                    sub,
+                    owner_sub,
+                    client_id,
                 }
-                // chirp-auth-client builds `Test` only from a test keyset;
-                // refuse rather than trust a production one that claims it.
-                ChirpVerifiedIdentity::Test { .. } => Err(AuthFailure::Unauthorized),
-            },
-            Environment::Test { tenant } => {
-                if inner.test_identities == TestIdentities::Reject {
-                    return Err(AuthFailure::Unauthorized);
-                }
-                let principal = match verified.identity {
-                    ChirpVerifiedIdentity::Human { sub } | ChirpVerifiedIdentity::Test { sub } => {
-                        TestPrincipal::Human { sub }
-                    }
-                    ChirpVerifiedIdentity::Machine {
-                        sub,
-                        owner_sub,
-                        client_id,
-                    } => {
-                        self.admit_machine(&client_id).await?;
-                        TestPrincipal::Machine {
-                            sub,
-                            owner_sub,
-                            client_id,
-                        }
-                    }
-                };
-                Ok(Caller::Test { tenant, principal })
             }
-        }
+        };
+        Ok(Authenticated {
+            caller,
+            plane: verified.environment,
+        })
     }
 
     /// The [`Machines::Dynamic`] check, made after the token verifies. The
@@ -382,6 +395,20 @@ impl Authenticator {
     }
 }
 
+/// The `iss` claim of a JWT, unverified. `None` for anything that is not a JWT
+/// with a string `iss`.
+fn unverified_issuer(token: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Iss {
+        iss: String,
+    }
+    let claims = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(claims).ok()?;
+    serde_json::from_slice::<Iss>(&bytes)
+        .ok()
+        .map(|claims| claims.iss)
+}
+
 fn non_empty(set: BTreeSet<String>, what: &str) -> Result<BTreeSet<String>, ConfigError> {
     let set: BTreeSet<String> = set
         .into_iter()
@@ -396,9 +423,11 @@ fn non_empty(set: BTreeSet<String>, what: &str) -> Result<BTreeSet<String>, Conf
     Ok(set)
 }
 
-/// The axum extractor: a handler taking a [`Caller`] gets a verified one, or
-/// the request is answered with the [`AuthFailure`]'s status.
-impl<S> FromRequestParts<S> for Caller
+/// The axum extractor: a handler taking [`Authenticated`] gets a verified
+/// caller and its plane, or the request is answered with the [`AuthFailure`]'s
+/// status. There is deliberately no extractor for [`Caller`] alone, so a
+/// handler cannot drop the plane without writing `..`.
+impl<S> FromRequestParts<S> for Authenticated
 where
     Authenticator: FromRef<S>,
     S: Send + Sync,

@@ -36,14 +36,16 @@ redaction; gotta leaked anyhow chains. This crate ends that drift.
 Shared chirp-auth request plumbing:
 - `Authenticator` — the one chirp bearer dispatcher. A `Policy` fixed at
   construction says which humans (audiences), which machines
-  (`Machines::None | Allow | Any | Dynamic`) and whether test-keyset principals
-  (`TestIdentities`) are accepted; `authenticate(&headers)` returns a `Caller`
-  or an `AuthFailure`. `Caller::Human` and `Caller::Machine` are production
-  callers by construction; anything a test keyset verified, person or machine,
-  is `Caller::Test { tenant, principal }`, so `TestIdentities::Reject` refuses
-  it all. A ChirpAuth outage is a 503,
-  never a 401, and a rejected machine token is never retried as a human. `Caller`
-  is an axum extractor (state needs `Authenticator: FromRef<S>`). The `env`
+  (`Machines::None | Allow | Any | Dynamic`) and which test tenants
+  (`test_tenants`, each verified at `{issuer}/test/{tenant}`) one deployment
+  serves. `authenticate(&headers)` returns `Authenticated { caller, plane }` or
+  an `AuthFailure`. The `Plane` (`Prod | Test { tenant }`) comes from the keyset
+  that verified the token and picks the service's store handle; `Caller`
+  (`Human | Machine`) carries no environment, so nothing below the handle sees
+  one (agent-platform--protocols#39). `planes()` lists every plane for boot. A
+  ChirpAuth outage is a 503,
+  never a 401, and a rejected machine token is never retried as a human.
+  `Authenticated` is the axum extractor (state needs `Authenticator: FromRef<S>`). The `env`
   readers use one naming scheme, `{PREFIX}_CHIRP_ISSUER`,
   `{PREFIX}_HUMAN_AUDIENCES`, `{PREFIX}_MACHINE_CLIENTS`, and a missing or
   blank one is a boot error.

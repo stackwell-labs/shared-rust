@@ -66,7 +66,19 @@ name = "platform-chirp-auth"
 # `Caller::environment()` returns an owned `Environment`. A service that took
 # test machines under `Reject` (model-gateway) switches to `Accept` and matches
 # `Caller::Test { principal: TestPrincipal::Machine { .. }, .. }`.
-version = "0.7.0"
+# 0.8.0 (shared-rust#19, repo tag v0.8.0) serves production and declared test
+# tenants from one deployment: `Policy::test_tenants` (`Option<BTreeSet>`)
+# replaces `test_identities`, each tenant verified at `{issuer}/test/{tenant}`.
+# `authenticate`/`verify` return `Authenticated { caller, plane }`, where `Plane`
+# (`Environment`, `Prod | Test { tenant }`) picks the service's store handle;
+# `Authenticator::planes()` lists them for boot. BREAKING: `TestIdentities`,
+# `TestPrincipal`, `Caller::Test` and `Caller::environment()` are gone (a test
+# caller is a `Caller::Human`/`Machine` on a test plane), and the axum
+# extractor is `Authenticated`, not `Caller`. A prod-only service (was
+# `Reject`) sets `test_tenants: None` and takes `Authenticated { caller, .. }`;
+# a test-issuer deployment (was `Accept`) sets `None` too, and its one plane is
+# `Test { tenant }` from the issuer.
+version = "0.8.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -83,7 +95,7 @@ dev-trusted-headers = []
 # dependencies]` entry for this crate should enable it.
 # It also turns on chirp-auth-client's own `testkit` (the event-signing kit
 # that `testkit` re-exports, shared-rust#17).
-testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:base64", "dep:tokio", "chirp-auth-client/testkit"]
+testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:tokio", "chirp-auth-client/testkit"]
 
 [dependencies]
 http = { workspace = true }
@@ -94,12 +106,13 @@ async-trait = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Reads a token's unverified `iss` to pick which plane's keyset verifies it.
+base64 = "0.22"
 platform-http-error = { path = "../platform-http-error" }
 # ── testkit's deps (optional; see the `testkit` feature) ────────────────────
 rsa = { version = "0.9", default-features = false, features = ["sha2", "std"], optional = true }
 sha2 = { version = "0.10", optional = true }
 rand = { version = "0.8", optional = true }
-base64 = { version = "0.22", optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]

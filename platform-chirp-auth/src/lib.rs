@@ -66,8 +66,8 @@ pub mod testkit;
 
 mod authenticator;
 pub use authenticator::{
-    env, AllowlistUnavailable, AuthFailure, Authenticator, Caller, ConfigError, MachineAllowlist,
-    Machines, Policy, TestIdentities, TestPrincipal,
+    env, AllowlistUnavailable, Authenticated, AuthFailure, Authenticator, Caller, ConfigError,
+    MachineAllowlist, Machines, Plane, Policy,
 };
 
 // ---- Header name constants (single source of truth) --------------------
