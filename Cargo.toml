@@ -45,7 +45,9 @@ aws-sdk-dynamodb = { version = "1.95.0", default-features = false, features = ["
 aws-sdk-secretsmanager = { version = "1.90.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 chirp-auth-client = { git = "https://github.com/chirpauth/client-rust", tag = "v0.18.0" }
 uuid = { version = "1", features = ["v4"] }
-async-trait = "0.1"
+# 0.1.92 is the first that stops adding a bare #[must_use] that clippy 1.99
+# flags as double_must_use (shared-rust#25).
+async-trait = "0.1.92"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
 base64 = "0.22"
