@@ -1939,7 +1939,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform-chirp-auth"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1949,10 +1949,12 @@ dependencies = [
  "rand 0.8.6",
  "reqwest",
  "rsa",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -43,6 +43,14 @@ Shared chirp-auth request plumbing:
 - `apply_on_behalf_of_grant<S: GrantStore>` — the generic
   machine-acting-on-behalf-of-a-human grant resolution, parameterized over a
   per-app grant lookup.
+- `PairwiseSub` (`sub_…`) and `RootId` (`usr_…`) — chirp's two human-id
+  namespaces as two types, serialized as the bare string, so mixing them is a
+  compile error rather than a 403 or a lost file.
+- `RootResolver` (`/control/root-for-sub`) and `OperatorIntrospector`
+  (`/operator/introspect`) — authenticated by the service's own
+  `MachineTokenMinter`, never a static bearer. Neither can be built
+  unconfigured, and every failure is `Unavailable`, never "no root" or "not an
+  operator" (shared-rust#5).
 
 ### `platform-outbound-guard`
 The one copy of the outbound-fetch (SSRF / DNS-rebinding) guard for

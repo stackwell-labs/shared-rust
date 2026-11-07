@@ -44,6 +44,15 @@ pub use chirp_auth_client::{
 /// (e.g. murmur) can also drop its direct chirp-auth-client dependency.
 pub use chirp_auth_client::mint;
 
+/// The pairwise-sub and root-id types (shared-rust#5).
+pub mod ids;
+pub use ids::{InvalidId, PairwiseSub, RootId};
+
+/// Machine-token clients for chirp's root-for-sub and operator-introspect
+/// routes (shared-rust#5).
+pub mod control;
+pub use control::{ConfigError, OperatorIntrospector, Resolved, RootResolver, Unavailable};
+
 /// Hermetic test tokens (local mock JWKS + real RS256 signing) — the
 /// replacement for `decode_trusted_headers`' unauthenticated dev-bypass path
 /// in test suites. See the module doc for usage.
