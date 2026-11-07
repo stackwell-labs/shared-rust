@@ -1,13 +1,14 @@
 //! Hermetic chirp-auth test tokens.
 //!
-//! A local mock JWKS server + real RS256 signing, so a service's tests
-//! exercise the SAME verification code (`verify_chirp_id_token` /
-//! `verify_from_headers`) production traffic goes through — instead of
-//! `decode_trusted_headers`' unauthenticated header-trust bypass. Ported from
-//! `chirp-auth-client`'s own private verify-path test harness (the proven
-//! approach for this exact problem); this crate makes it a public, reusable
-//! primitive so every service's tests can adopt it instead of hand-rolling
-//! their own trusted-header dev mode.
+//! A local JWKS server and real RS256 signing, so a service's tests exercise
+//! the SAME verification code (`verify_chirp_id_token` / `verify_from_headers`)
+//! production traffic goes through, instead of `decode_trusted_headers`'
+//! unauthenticated header-trust bypass.
+//!
+//! Built on chirp-auth-client's own `testkit` (shared-rust#10): tokens are
+//! signed with its fixed [`TestSigningKey`] and keys are served by its
+//! [`JwksServer`], so the platform has one test-signing harness and no test
+//! build generates an RSA key.
 //!
 //! ```no_run
 //! # async fn example() {
@@ -23,13 +24,7 @@
 
 use std::sync::OnceLock;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rsa::pkcs1v15::SigningKey;
-use rsa::signature::{RandomizedSigner, SignatureEncoding};
-use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
-use sha2::Sha256;
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -62,22 +57,17 @@ pub use chirp_auth_client::testkit::{user_deleted_claims, JwksServer, TestSignin
 /// The `kid` every testkit-minted token and the testkit JWKS agree on.
 pub const TEST_KID: &str = "platform-testkit-kid-1";
 
-/// One RSA-2048 keypair, generated lazily and shared for the process
-/// lifetime — RSA keygen is the slow part (~200ms); a test suite that mints
-/// many tokens should not pay it more than once.
-fn keypair() -> &'static RsaPrivateKey {
-    static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-    KEY.get_or_init(|| {
-        let mut rng = rand::thread_rng();
-        RsaPrivateKey::new(&mut rng, 2048).expect("generate testkit RSA key")
-    })
+/// The one key every testkit-minted token is signed with and every testkit
+/// JWKS publishes: chirp-auth-client's fixed primary test key, under
+/// [`TEST_KID`].
+fn signing_key() -> &'static TestSigningKey {
+    static KEY: OnceLock<TestSigningKey> = OnceLock::new();
+    KEY.get_or_init(|| TestSigningKey::new(TEST_KID))
 }
 
-fn jwks_body() -> String {
-    let pubkey = RsaPublicKey::from(keypair());
-    let n = URL_SAFE_NO_PAD.encode(pubkey.n().to_bytes_be());
-    let e = URL_SAFE_NO_PAD.encode(pubkey.e().to_bytes_be());
-    format!(r#"{{"keys":[{{"kty":"RSA","kid":"{TEST_KID}","alg":"RS256","n":"{n}","e":"{e}"}}]}}"#)
+/// Start a [`JwksServer`] publishing the testkit key on the current runtime.
+async fn start_issuer() -> JwksServer {
+    JwksServer::start(vec![signing_key().jwk()]).await
 }
 
 /// Bind `127.0.0.1:0` and serve the testkit JWKS to every request until the
@@ -88,26 +78,20 @@ fn jwks_body() -> String {
 /// `#[tokio::test]` gets a fresh runtime per test. For a server shared across
 /// tests, use [`Fixture::global`].
 pub async fn start_jwks_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind testkit jwks listener");
-    let addr = listener.local_addr().expect("testkit jwks local_addr");
-    tokio::spawn(serve(listener, "200 OK", jwks_body()));
-    format!("http://{addr}/jwks.json")
+    format!("{}/jwks.json", start_issuer().await.issuer())
 }
 
-/// Answer every request on `listener` with `status` and `body`, whatever the
-/// path (so an issuer base and its `/test/{tenant}` children all resolve).
-async fn serve(listener: TcpListener, status: &'static str, body: String) {
+/// Answer every request on `listener` with API Gateway's 429 throttle,
+/// whatever the path. (`JwksServer` only ever answers 200.)
+async fn serve_throttled(listener: TcpListener) {
+    const BODY: &str = r#"{"message":"Too Many Requests"}"#;
     while let Ok((mut stream, _)) = listener.accept().await {
-        let body = body.clone();
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let _ = stream.read(&mut buf).await;
             let resp = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                BODY.len()
             );
             let _ = stream.write_all(resp.as_bytes()).await;
             let _ = stream.shutdown().await;
@@ -154,26 +138,23 @@ impl Fixture {
                         .build()
                         .expect("testkit fixture runtime");
                     runtime.block_on(async move {
-                        let live = TcpListener::bind("127.0.0.1:0").await.expect("bind testkit issuer");
+                        // The JwksServer's accept loop is a task on this
+                        // runtime, which `serve_throttled` keeps alive forever.
+                        let live = start_issuer().await;
                         let throttled = TcpListener::bind("127.0.0.1:0")
                             .await
                             .expect("bind testkit throttled issuer");
                         let urls = (
-                            format!("http://{}", live.local_addr().expect("testkit issuer addr")),
+                            live.issuer().to_owned(),
                             format!("http://{}", throttled.local_addr().expect("throttled addr")),
                         );
                         sender.send(urls).expect("testkit fixture caller went away");
-                        let live = tokio::spawn(serve(live, "200 OK", jwks_body()));
-                        let throttled = tokio::spawn(serve(
-                            throttled,
-                            "429 Too Many Requests",
-                            r#"{"message":"Too Many Requests"}"#.to_owned(),
-                        ));
-                        let _ = tokio::join!(live, throttled);
+                        serve_throttled(throttled).await;
                     });
                 })
                 .expect("spawn testkit fixture thread");
-            let (issuer, throttled_issuer) = receiver.recv().expect("testkit fixture failed to start");
+            let (issuer, throttled_issuer) =
+                receiver.recv().expect("testkit fixture failed to start");
             Fixture {
                 issuer,
                 throttled_issuer,
@@ -200,23 +181,14 @@ impl Fixture {
     }
 }
 
-fn sign(signing_input: &[u8]) -> Vec<u8> {
-    let signer = SigningKey::<Sha256>::new(keypair().clone());
-    let mut rng = rand::thread_rng();
-    signer
-        .sign_with_rng(&mut rng, signing_input)
-        .to_bytes()
-        .to_vec()
-}
-
-fn b64(s: &str) -> String {
-    URL_SAFE_NO_PAD.encode(s.as_bytes())
-}
-
-fn make_jwt(header_json: &str, claims_json: &str) -> String {
-    let signing_input = format!("{}.{}", b64(header_json), b64(claims_json));
-    let sig = sign(signing_input.as_bytes());
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig))
+/// An id_token with the header ChirpAuth stamps on one, signed by the testkit
+/// key, carrying `claims` plus an `exp` an hour out.
+fn mint_id_token(mut claims: Value) -> String {
+    claims["exp"] = json!(now_unix() + 3600);
+    signing_key().sign(
+        &json!({"alg": "RS256", "typ": ID_TOKEN_TYP, "kid": TEST_KID}),
+        &claims,
+    )
 }
 
 fn now_unix() -> i64 {
@@ -229,12 +201,7 @@ fn now_unix() -> i64 {
 /// Mint a real, signed HUMAN chirp id_token: `{iss, sub, aud, exp}`, no
 /// `act` claim — verifies as `ChirpVerifiedIdentity::Human`.
 pub fn mint_human_id_token(iss: &str, aud: &str, sub: &str) -> String {
-    let header = format!(r#"{{"alg":"RS256","typ":"{ID_TOKEN_TYP}","kid":"{TEST_KID}"}}"#);
-    let claims = format!(
-        r#"{{"iss":"{iss}","sub":"{sub}","aud":"{aud}","exp":{}}}"#,
-        now_unix() + 3600
-    );
-    make_jwt(&header, &claims)
+    mint_id_token(json!({"iss": iss, "sub": sub, "aud": aud}))
 }
 
 /// Mint a real, signed MACHINE chirp id_token: `{iss, sub, aud, exp,
@@ -242,24 +209,20 @@ pub fn mint_human_id_token(iss: &str, aud: &str, sub: &str) -> String {
 /// `sub` is the machine's own agent sub; `owner_sub` is the human who
 /// registered the client; `aud` is conventionally the client_id.
 pub fn mint_machine_id_token(iss: &str, aud: &str, sub: &str, owner_sub: &str) -> String {
-    let header = format!(r#"{{"alg":"RS256","typ":"{ID_TOKEN_TYP}","kid":"{TEST_KID}"}}"#);
-    let claims = format!(
-        r#"{{"iss":"{iss}","sub":"{sub}","aud":"{aud}","exp":{},"act":"machine","owner_sub":"{owner_sub}"}}"#,
-        now_unix() + 3600
-    );
-    make_jwt(&header, &claims)
+    mint_id_token(json!({
+        "iss": iss,
+        "sub": sub,
+        "aud": aud,
+        "act": "machine",
+        "owner_sub": owner_sub,
+    }))
 }
 
 /// Mint a real, signed TEST-keyset chirp id_token for a person: `{iss, sub,
 /// aud, exp, test: true}`. Verifies as `ChirpVerifiedIdentity::Test` against a
 /// `…/test/{tenant}` issuer (see [`Fixture::test_issuer`]).
 pub fn mint_test_id_token(iss: &str, aud: &str, sub: &str) -> String {
-    let header = format!(r#"{{"alg":"RS256","typ":"{ID_TOKEN_TYP}","kid":"{TEST_KID}"}}"#);
-    let claims = format!(
-        r#"{{"iss":"{iss}","sub":"{sub}","aud":"{aud}","exp":{},"test":true}}"#,
-        now_unix() + 3600
-    );
-    make_jwt(&header, &claims)
+    mint_id_token(json!({"iss": iss, "sub": sub, "aud": aud, "test": true}))
 }
 
 /// A `ChirpAuthConfig` pointed at the testkit's local mock JWKS server —
@@ -315,21 +278,42 @@ mod tests {
         }
     }
 
+    /// A token whose signature the testkit JWKS does not hold is rejected:
+    /// the testkit path checks signatures for real.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_token_signed_under_a_different_testkit_key_fails_to_verify() {
-        // Two independent JWKS servers each get their OWN process-wide keypair
-        // (the OnceLock is per-binary, not per-server) — this test exists to
-        // document that property rather than exercise cross-key rejection
-        // directly, since a single test binary shares one testkit keypair by
-        // design (that's what makes minting cheap). Real cross-tenant
-        // signature rejection is chirp-auth-client's own, already-proven
-        // verify-path coverage.
+    async fn a_token_signed_by_another_key_fails_to_verify() {
         let jwks = start_jwks_server().await;
         let cfg = config("https://signin.test.example", "cs_test_aud", jwks);
-        // A well-formed but WRONG-aud token must still be rejected — proves
-        // the testkit path runs real claim validation, not just a signature
-        // check.
-        let token = mint_human_id_token("https://signin.test.example", "cs_someone_else", "sub_alice");
+        let foreign = TestSigningKey::other(TEST_KID).sign(
+            &json!({"alg": "RS256", "typ": ID_TOKEN_TYP, "kid": TEST_KID}),
+            &json!({
+                "iss": "https://signin.test.example",
+                "sub": "sub_alice",
+                "aud": "cs_test_aud",
+                "exp": now_unix() + 3600,
+            }),
+        );
+        let result = verify_chirp_id_token(
+            &reqwest::Client::new(),
+            &cfg,
+            &foreign,
+            VerifyOptions::default(),
+        )
+        .await;
+        assert!(result.is_err(), "a foreign signature must be rejected");
+    }
+
+    /// A well-signed token for another audience is rejected: the testkit path
+    /// runs real claim validation, not just a signature check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_for_another_audience_fails_to_verify() {
+        let jwks = start_jwks_server().await;
+        let cfg = config("https://signin.test.example", "cs_test_aud", jwks);
+        let token = mint_human_id_token(
+            "https://signin.test.example",
+            "cs_someone_else",
+            "sub_alice",
+        );
         let result = verify_chirp_id_token(
             &reqwest::Client::new(),
             &cfg,

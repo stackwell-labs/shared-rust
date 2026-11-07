@@ -78,7 +78,12 @@ name = "platform-chirp-auth"
 # `Reject`) sets `test_tenants: None` and takes `Authenticated { caller, .. }`;
 # a test-issuer deployment (was `Accept`) sets `None` too, and its one plane is
 # `Test { tenant }` from the issuer.
-version = "0.8.0"
+# 0.8.1 (shared-rust#10, repo tag v0.10.1) rebuilds `testkit` on
+# chirp-auth-client's: tokens are signed with its fixed `TestSigningKey` and
+# keys served by its `JwksServer`, so the `rsa`/`sha2`/`rand` deps and the
+# per-process RSA keygen are gone. Same public API; the key is now a fixed
+# public test key rather than one generated per test binary.
+version = "0.8.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -91,11 +96,11 @@ description = "Shared chirp-auth glue: the bearer Authenticator, error classific
 # is also used by authenticated impersonation in production.
 dev-trusted-headers = []
 # The hermetic-test-token module (`testkit`). Optional so a production
-# dependent never pulls in RSA keygen/signing; every service's `[dev-
-# dependencies]` entry for this crate should enable it.
-# It also turns on chirp-auth-client's own `testkit` (the event-signing kit
-# that `testkit` re-exports, shared-rust#17).
-testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:tokio", "chirp-auth-client/testkit"]
+# dependent never pulls in test signing keys or a JWKS server; every service's
+# `[dev-dependencies]` entry for this crate should enable it.
+# It is built on chirp-auth-client's own `testkit` (its fixed signing keys and
+# JWKS server, shared-rust#10), which it also re-exports (shared-rust#17).
+testkit = ["dep:tokio", "chirp-auth-client/testkit"]
 
 [dependencies]
 http = { workspace = true }
@@ -110,10 +115,8 @@ serde_json = { workspace = true }
 base64 = "0.22"
 platform-http-error = { path = "../platform-http-error" }
 # ── testkit's deps (optional; see the `testkit` feature) ────────────────────
-rsa = { version = "0.9", default-features = false, features = ["sha2", "std"], optional = true }
-sha2 = { version = "0.10", optional = true }
-rand = { version = "0.8", optional = true }
-tokio = { workspace = true, optional = true }
+# The fixture's own runtime thread and its 429 issuer.
+tokio = { workspace = true, optional = true, features = ["io-util"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
@@ -121,14 +124,4 @@ tower = { workspace = true }
 # This crate with `testkit` on, so a plain `cargo test --workspace` (CI's
 # command) builds and runs the testkit and the Authenticator tests that use it.
 platform-chirp-auth = { path = ".", features = ["testkit"] }
-# Verify-path harness for the shared MachineAuth tests: mint real RS256 tokens
-# against a generated keypair and serve a JWKS from an in-process server, the
-# same approach chirp-auth-client's own verify-path tests use. The crypto path
-# itself is the lib's; these prove the shared layer's identity-type dispatch
-# (reject Human), error->Unauthorized mapping, and env/issuer threading.
-# Also exercises `testkit` itself, so dev-deps enable that feature.
-rsa = { version = "0.9", default-features = false, features = ["sha2", "std"] }
-sha2 = "0.10"
-rand = "0.8"
-base64 = "0.22"
 wiremock = "0.6"

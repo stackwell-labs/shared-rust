@@ -56,8 +56,9 @@ Shared chirp-auth request plumbing:
   `chirp-auth-client`, for a receiver of Chirp's `user.deleted` webhook.
 - `testkit` (feature) — real RS256 tokens, and `Fixture::global()`: a local
   issuer and a throttled (429) one on a thread that outlives each test's
-  runtime. Also re-exports chirp-auth-client's event-signing kit
-  (`JwksServer`, `TestSigningKey`, `user_deleted_claims`) for webhook tests.
+  runtime. Built on chirp-auth-client's event-signing kit (`JwksServer`,
+  `TestSigningKey`, `user_deleted_claims`), which it also re-exports for
+  webhook tests.
 - `bearer_token` — re-exported from `chirp-auth-client` (RFC-7235 extraction).
 - `decode_trusted_headers` — the dev/integration-test trusted-header decoder
   with the 128-char / no-control-char uid + agent-id validation, behind a

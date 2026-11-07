@@ -1017,92 +1017,11 @@ mod machine_auth_config_tests {
 #[cfg(test)]
 mod machine_auth_verify_tests {
     use super::{MachineAuth, MachineAuthError, VerifiedMachine};
-    use base64::Engine as _;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use crate::testkit::{mint_human_id_token, mint_machine_id_token, start_jwks_server, Fixture};
     use chirp_auth_client::Environment;
     use platform_http_error::ApiError;
-    use rsa::pkcs1v15::SigningKey;
-    use rsa::signature::{RandomizedSigner, SignatureEncoding};
-    use rsa::traits::PublicKeyParts;
-    use rsa::{RsaPrivateKey, RsaPublicKey};
-    use sha2::Sha256;
-    use std::sync::OnceLock;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
-    const KID: &str = "test-kid-1";
     const CLIENT_ID: &str = "cs_live_accepted";
-
-    fn keypair() -> &'static RsaPrivateKey {
-        static KEY: OnceLock<RsaPrivateKey> = OnceLock::new();
-        KEY.get_or_init(|| {
-            let mut rng = rand::thread_rng();
-            RsaPrivateKey::new(&mut rng, 2048).expect("generate test RSA key")
-        })
-    }
-
-    fn jwks_body() -> String {
-        let pubkey = RsaPublicKey::from(keypair());
-        let n = URL_SAFE_NO_PAD.encode(pubkey.n().to_bytes_be());
-        let e = URL_SAFE_NO_PAD.encode(pubkey.e().to_bytes_be());
-        format!(r#"{{"keys":[{{"kty":"RSA","kid":"{KID}","alg":"RS256","n":"{n}","e":"{e}"}}]}}"#)
-    }
-
-    async fn start_jwks_server(body: String) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{addr}/jwks.json");
-        tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(_) => return,
-                };
-                let body = body.clone();
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        url
-    }
-
-    fn b64(s: &str) -> String {
-        URL_SAFE_NO_PAD.encode(s.as_bytes())
-    }
-
-    fn sign(signing_input: &[u8]) -> Vec<u8> {
-        let signer = SigningKey::<Sha256>::new(keypair().clone());
-        let mut rng = rand::thread_rng();
-        signer.sign_with_rng(&mut rng, signing_input).to_bytes().to_vec()
-    }
-
-    fn make_jwt(claims_json: &str) -> String {
-        // The typ chirp actually stamps on ID tokens (machine tokens are ID tokens
-        // with act:machine). client v0.13 made this typ REQUIRED on the verify path,
-        // so a fixture minting the generic "JWT" typ is now rejected — mint what the
-        // real issuer does.
-        let header = format!(r#"{{"alg":"RS256","typ":"chirp-id+jwt","kid":"{KID}"}}"#);
-        let signing_input = format!("{}.{}", b64(&header), b64(claims_json));
-        let sig = sign(signing_input.as_bytes());
-        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig))
-    }
-
-    fn now() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-    }
 
     /// Build a `MachineAuth` accepting `CLIENT_ID` whose JWKS fetch hits the
     /// in-process server at `jwks_url`.
@@ -1123,14 +1042,10 @@ mod machine_auth_verify_tests {
     /// threaded through unchanged.
     #[tokio::test(flavor = "multi_thread")]
     async fn verifies_machine_token_and_returns_env_verbatim() {
-        let jwks = start_jwks_server(jwks_body()).await;
+        let jwks = start_jwks_server().await;
         let machine = machine_for(&jwks);
         let iss = machine.issuer().to_owned();
-        let claims = format!(
-            r#"{{"iss":"{iss}","sub":"agent_xyz","aud":"{CLIENT_ID}","exp":{},"act":"machine","owner_sub":"sub_owner"}}"#,
-            now() + 3600
-        );
-        let token = make_jwt(&claims);
+        let token = mint_machine_id_token(&iss, CLIENT_ID, "agent_xyz", "sub_owner");
         let VerifiedMachine {
             sub,
             owner_sub,
@@ -1155,16 +1070,12 @@ mod machine_auth_verify_tests {
     /// collapses to `Unauthorized` for the simple consumers via `into_api_error`.
     #[tokio::test(flavor = "multi_thread")]
     async fn rejects_human_token_on_machine_path() {
-        let jwks = start_jwks_server(jwks_body()).await;
+        let jwks = start_jwks_server().await;
         let machine = machine_for(&jwks);
         let iss = machine.issuer().to_owned();
         // A human token's `aud` must match the config's accepted set (the lib
         // gates human `aud`); the accepted set is `CLIENT_ID`, so use it.
-        let claims = format!(
-            r#"{{"iss":"{iss}","sub":"sub_human","aud":"{CLIENT_ID}","exp":{}}}"#,
-            now() + 3600
-        );
-        let token = make_jwt(&claims);
+        let token = mint_human_id_token(&iss, CLIENT_ID, "sub_human");
         let err = machine
             .verify(&reqwest::Client::new(), &token)
             .await
@@ -1181,16 +1092,12 @@ mod machine_auth_verify_tests {
     /// NOT be re-treated as a user token (Granite's `Some(Err)` outcome).
     #[tokio::test(flavor = "multi_thread")]
     async fn rejects_non_allowlisted_machine_client() {
-        let jwks = start_jwks_server(jwks_body()).await;
+        let jwks = start_jwks_server().await;
         let machine = machine_for(&jwks);
         let iss = machine.issuer().to_owned();
         // Mint a machine token for a DIFFERENT client_id (its own `aud`), not in
         // the accepted set. It passes sig/iss/exp but fails the machine gate.
-        let claims = format!(
-            r#"{{"iss":"{iss}","sub":"agent_other","aud":"cs_live_not_accepted","exp":{},"act":"machine","owner_sub":"sub_owner"}}"#,
-            now() + 3600
-        );
-        let token = make_jwt(&claims);
+        let token = mint_machine_id_token(&iss, "cs_live_not_accepted", "agent_other", "sub_owner");
         let err = machine
             .verify(&reqwest::Client::new(), &token)
             .await
@@ -1205,31 +1112,11 @@ mod machine_auth_verify_tests {
     /// silent-401 failure mode this variant exists to end).
     #[tokio::test(flavor = "multi_thread")]
     async fn throttled_jwks_is_unavailable_not_a_401() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let jwks = format!("http://{}/jwks.json", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let _ = stream.read(&mut buf).await;
-                    let body = r#"{"message":"Too Many Requests"}"#;
-                    let resp = format!(
-                        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-        let machine = machine_for(&jwks);
-        let iss = machine.issuer().to_owned();
-        let claims = format!(
-            r#"{{"iss":"{iss}","sub":"agent_xyz","aud":"{CLIENT_ID}","exp":{},"act":"machine","owner_sub":"sub_owner"}}"#,
-            now() + 3600
-        );
+        let issuer = Fixture::global().throttled_issuer();
+        let machine = MachineAuth::new(issuer.to_owned(), [CLIENT_ID.to_owned()]);
+        let token = mint_machine_id_token(issuer, CLIENT_ID, "agent_xyz", "sub_owner");
         let err = machine
-            .verify(&reqwest::Client::new(), &make_jwt(&claims))
+            .verify(&reqwest::Client::new(), &token)
             .await
             .expect_err("an unfetchable JWKS cannot verify anything");
         assert_eq!(err, MachineAuthError::Unavailable);

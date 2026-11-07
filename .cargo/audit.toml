@@ -5,10 +5,11 @@
 [advisories]
 ignore = [
   # rsa Marvin timing attack, no fixed release (https://rustsec.org/advisories/RUSTSEC-2023-0071).
-  # rsa is reached only via the opt-in `testkit` features of platform-chirp-auth
-  # and platform-fcm, and their tests: RS256 signing and verifying with a
-  # throwaway in-process key, so there is no real private key to recover and no
-  # remote timing oracle. Production RS256 (chirp-auth-client's verify,
-  # platform-fcm's signing via ring) does not use the rsa crate.
+  # rsa is reached only via platform-fcm's opt-in `testkit` feature and its
+  # tests: RS256 signing and verifying with a throwaway in-process key, so there
+  # is no real private key to recover and no remote timing oracle. Production
+  # RS256 (chirp-auth-client's verify, platform-fcm's signing via ring) does not
+  # use the rsa crate. (platform-chirp-auth's testkit signs with ring since
+  # shared-rust#10.)
   "RUSTSEC-2023-0071",
 ]
