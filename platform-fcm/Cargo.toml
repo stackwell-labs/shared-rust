@@ -1,0 +1,32 @@
+[package]
+name = "platform-fcm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The one FCM HTTP v1 sender: service-account parsing, the RS256 OAuth mint and cache, a send that reports a typed Delivery, and a Message that makes every caller choose its Android priority."
+
+[features]
+# The fake-FCM harness (`testkit`): a local OAuth token endpoint that verifies
+# the RS256 assertion, and a local FCM send endpoint that records messages and
+# answers per device. Optional so a production dependent never builds RSA
+# keygen or an HTTP server; a service's `[dev-dependencies]` entry enables it.
+testkit = ["dep:rsa", "dep:sha2", "dep:rand", "dep:axum", "dep:tokio"]
+
+[dependencies]
+async-trait = { workspace = true }
+base64 = { workspace = true }
+reqwest = { workspace = true }
+ring = "0.17"
+serde_json = { workspace = true }
+# ── testkit's deps (optional; see the `testkit` feature) ────────────────────
+rsa = { version = "0.9", default-features = false, features = ["sha2", "std"], optional = true }
+sha2 = { version = "0.10", optional = true }
+rand = { version = "0.8", optional = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# The crate's own tests drive the real sender against the testkit fake.
+platform-fcm = { path = ".", features = ["testkit"] }

@@ -1968,6 +1968,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform-fcm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "platform-fcm",
+ "rand 0.8.6",
+ "reqwest",
+ "ring",
+ "rsa",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "platform-http-error"
 version = "0.1.0"
 dependencies = [

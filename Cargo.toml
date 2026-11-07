@@ -12,6 +12,7 @@ members = [
     "platform-vault-dynamo",
     "platform-synthetic-user",
     "platform-secrets",
+    "platform-fcm",
 ]
 
 [workspace.package]
