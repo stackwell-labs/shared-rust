@@ -17,7 +17,8 @@ platform-chirp-auth = { git = "https://github.com/coreygirard/agent-platform--pl
 The axum-on-Lambda runtime glue that drive/pigeon/bowerbird carried
 byte-identically: `run_lambda` (wraps a `Router` in `axum_aws_lambda::LambdaLayer`
 and runs it under the Lambda runtime), `shutdown_signal` (Ctrl-C + SIGTERM),
-`init_tracing(default_filter)`, and a one-call `serve(app, ServeConfig{ … })`
+`init_tracing(default_filter)` (idempotent, so a backend can install tracing as the
+first line of `main`), and a one-call `serve(app, ServeConfig{ … })`
 that owns the local-vs-Lambda detect.
 
 ### `platform-http-error`

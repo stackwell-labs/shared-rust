@@ -25,6 +25,7 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 
 use axum::Router;
 use tokio::net::TcpListener;
@@ -55,13 +56,35 @@ pub struct ServeConfig {
     pub default_filter: &'static str,
 }
 
+/// The `default_filter` the global subscriber was installed with, set by the
+/// first [`init_tracing`] call.
+static INSTALLED_FILTER: OnceLock<String> = OnceLock::new();
+
 /// Initialize the global tracing subscriber from the environment, falling
-/// back to `default_filter` when no `EnvFilter` is set. Byte-identical to the
-/// `init_tracing` each backend carried.
+/// back to `default_filter` when no `EnvFilter` is set.
+///
+/// Idempotent: the first call installs the subscriber; a later call with the
+/// same `default_filter` does nothing. That is what lets a backend call it as
+/// the first line of `main`, so events emitted while it builds its app (before
+/// [`serve`], which calls it again) reach the log instead of being dropped for
+/// want of a subscriber (drive#59).
+///
+/// # Panics
+///
+/// If a later call passes a different `default_filter` (it would silently not
+/// apply), or if a subscriber not installed by this function is already the
+/// global default.
 pub fn init_tracing(default_filter: &str) {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let installed = INSTALLED_FILTER.get_or_init(|| {
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        default_filter.to_owned()
+    });
+    assert_eq!(
+        installed, default_filter,
+        "init_tracing already installed the subscriber with a different default filter"
+    );
 }
 
 /// Run `app` under the AWS Lambda runtime, wrapping it in the
@@ -102,7 +125,8 @@ pub async fn shutdown_signal() {
 
 /// One-call entrypoint owning the local-vs-Lambda detect.
 ///
-/// Initializes tracing, then:
+/// Initializes tracing (a no-op if the caller already did, with the same
+/// filter: see [`init_tracing`]), then:
 /// - if `AWS_LAMBDA_RUNTIME_API` is set, runs `app` under the Lambda runtime;
 /// - otherwise binds the configured address and serves locally with graceful
 ///   shutdown on Ctrl-C / SIGTERM.
