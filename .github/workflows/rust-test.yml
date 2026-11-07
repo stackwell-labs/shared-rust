@@ -138,11 +138,18 @@ jobs:
       # Android, GHC and CodeQL. Removing them, before the cache is unpacked,
       # gives every build that space back. Docker, Node and Java stay: callers
       # run DynamoDB-Local and S3 in docker and Playwright via extra-cmd.
-      - name: free disk space
+      #
+      # The delete frees ~22 GB but takes ~55 s (measured 2026-11-07), most of
+      # a warm run's length, and private repos pay for every minute. So it runs
+      # in the background, overlapping the toolchain install and the cache
+      # restore, and `wait for disk space` below holds the build until it is
+      # done. The runner keeps a step's background processes alive until the
+      # job ends. The marker holds rm's exit status, so a failed or hung delete
+      # fails that step instead of letting the build race a full disk.
+      - name: free disk space (background)
         run: |
           df -h /
-          time sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h /
+          sudo sh -c 'rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL; echo $? > "$1"' sh "$RUNNER_TEMP/disk-freed" >/dev/null 2>&1 &
       - name: install rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -184,6 +191,13 @@ jobs:
           # better than the state above, where the entry it would have reused was
           # being evicted anyway.
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      - name: wait for disk space
+        run: |
+          marker="$RUNNER_TEMP/disk-freed"
+          time timeout 300 sh -c 'until [ -s "$1" ]; do sleep 1; done' sh "$marker"
+          status=$(cat "$marker")
+          [ "$status" = 0 ] || { echo "::error::freeing disk space failed: rm exited $status"; exit 1; }
+          df -h /
       - name: setup
         if: ${{ inputs.setup-cmd != '' }}
         working-directory: ${{ inputs.working-directory }}
