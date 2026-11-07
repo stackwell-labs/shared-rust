@@ -76,6 +76,15 @@ Shared chirp-auth request plumbing:
   unconfigured, and every failure is `Unavailable`, never "no root" or "not an
   operator" (shared-rust#5).
 
+### `platform-granite-authz`
+The one Granite authoriser (shared-rust#21): `GraniteAuthz::authorize(&Authenticated,
+&headers, resource, scope)` reads the caller's `x-approval-grant` and `x-user-id`,
+asks Granite's `/v1/grants/verify` with the service's own machine token and the
+caller as subject, and returns the approved grant. Not approved is a 403;
+Granite unreachable or a mint failure is a 503, never a 401. Online with no
+cache, and one EMF line per verify (latency, unavailable) per service and
+caller. See its README.
+
 ### `platform-outbound-guard`
 The one copy of the outbound-fetch (SSRF / DNS-rebinding) guard for
 requester-supplied URLs. Two decisions: a public-address **allowlist**

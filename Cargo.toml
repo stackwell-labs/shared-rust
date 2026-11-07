@@ -13,6 +13,7 @@ members = [
     "platform-synthetic-user",
     "platform-secrets",
     "platform-fcm",
+    "platform-granite-authz",
 ]
 
 [workspace.package]

@@ -1,0 +1,23 @@
+[package]
+name = "platform-granite-authz"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The one Granite authoriser: verify the caller's x-approval-grant against Granite online, 403 when not approved, 503 when Granite can't answer, with a per-caller latency and error metric."
+
+# Its own crate, not a platform-chirp-auth module, so that Granite and ChirpAuth,
+# which depend on platform-chirp-auth, never link a path that calls Granite
+# (shared-rust#21).
+[dependencies]
+http = { workspace = true }
+platform-chirp-auth = { path = "../platform-chirp-auth" }
+platform-http-error = { path = "../platform-http-error" }
+granite-client = { git = "https://github.com/stackwell-labs/granite-client-rust.git", tag = "v0.15.0" }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"
