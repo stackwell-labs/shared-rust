@@ -47,11 +47,13 @@ name = "platform-chirp-auth"
 # (`{PREFIX}_CHIRP_ISSUER` / `_HUMAN_AUDIENCES` / `_MACHINE_CLIENTS`). The
 # testkit gains `Fixture::global()` (a JWKS issuer and a throttled one on a
 # long-lived thread) and `mint_test_id_token`. Additive; `MachineAuth` stays.
+# 0.6.0 also adds (shared-rust#5) the `PairwiseSub`/`RootId` id types and the
+# machine-token `RootResolver`/`OperatorIntrospector` clients. Additive.
 version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared chirp-auth glue: the bearer Authenticator, error classification, header constants, generic on-behalf-of grant resolution."
+description = "Shared chirp-auth glue: the bearer Authenticator, error classification, header constants, generic on-behalf-of grant resolution, pairwise/root id types, root-resolve and operator-introspect clients."
 
 [features]
 # Marker feature each backend forwards to gate ITS unauthenticated trusted-header
@@ -71,6 +73,8 @@ chirp-auth-client = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 platform-http-error = { path = "../platform-http-error" }
 # ── testkit's deps (optional; see the `testkit` feature) ────────────────────
 rsa = { version = "0.9", default-features = false, features = ["sha2", "std"], optional = true }
@@ -95,4 +99,4 @@ rsa = { version = "0.9", default-features = false, features = ["sha2", "std"] }
 sha2 = "0.10"
 rand = "0.8"
 base64 = "0.22"
-serde_json = "1"
+wiremock = "0.6"

@@ -186,11 +186,13 @@ impl IntoResponse for AuthFailure {
     }
 }
 
-/// A [`Policy`] that cannot be served, or a missing or blank env var. Refuse to
-/// boot on it: a half-configured service would otherwise 401 every request
-/// while its health check stays green.
+/// A [`Policy`] that cannot be served, a missing or blank env var, or a chirp
+/// control client ([`RootResolver`](crate::RootResolver),
+/// [`OperatorIntrospector`](crate::OperatorIntrospector)) given a base URL it
+/// cannot use. Refuse to boot on it: a half-configured service would otherwise
+/// 401 or 503 every request while its health check stays green.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigError(String);
+pub struct ConfigError(pub(crate) String);
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
