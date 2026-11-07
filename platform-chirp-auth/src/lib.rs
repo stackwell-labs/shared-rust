@@ -50,6 +50,12 @@ pub use chirp_auth_client::mint;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
+mod authenticator;
+pub use authenticator::{
+    env, AllowlistUnavailable, AuthFailure, Authenticator, Caller, ConfigError, MachineAllowlist,
+    Machines, Policy, TestIdentities,
+};
+
 // ---- Header name constants (single source of truth) --------------------
 
 /// Trusted-header user id. Bypasses token verification — only honored when a
