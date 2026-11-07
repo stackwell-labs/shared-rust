@@ -21,7 +21,7 @@
 //! extra `_service-info` fields (drive, for instance, appends `default_limits`)
 //! while still sharing the common core.
 
-use axum::{Json, Router, routing::get};
+use axum::{routing::get, Json, Router};
 use serde::Serialize;
 
 /// An axum [`Router`] serving `GET /health` → `{"service": "<name>", "status":
@@ -41,7 +41,10 @@ use serde::Serialize;
 /// `service` is `'static` because the value is a compile-time constant in every
 /// caller — the same constant the hand-rolled handlers embedded.
 pub fn health_router(service: &'static str) -> Router {
-    Router::new().route("/health", get(move || async move { Json(Health::ok(service)) }))
+    Router::new().route(
+        "/health",
+        get(move || async move { Json(Health::ok(service)) }),
+    )
 }
 
 /// The `GET /health` response: `{"service": "<name>", "status": "ok"}`.
@@ -115,7 +118,10 @@ mod tests {
     #[test]
     fn health_serializes_to_the_canonical_shape() {
         let json = serde_json::to_value(Health::ok("granite")).unwrap();
-        assert_eq!(json, serde_json::json!({"service": "granite", "status": "ok"}));
+        assert_eq!(
+            json,
+            serde_json::json!({"service": "granite", "status": "ok"})
+        );
     }
 
     #[tokio::test]
@@ -137,7 +143,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(json, serde_json::json!({"service": "drive", "status": "ok"}));
+        assert_eq!(
+            json,
+            serde_json::json!({"service": "drive", "status": "ok"})
+        );
     }
 
     /// The router serves ONLY `/health`. `/healthz` is intentionally NOT served,

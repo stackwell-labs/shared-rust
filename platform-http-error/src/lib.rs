@@ -11,9 +11,9 @@
 //! internal `5xx` message reaches the client, because the redaction key off
 //! the status code itself — not off which variant produced it.
 
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::Serialize;
 
 /// The body a client sees for a redacted server error. Constant so a 5xx

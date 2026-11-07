@@ -24,6 +24,10 @@ use uuid::Uuid;
 /// `None` when the header is absent / non-bearer / empty.
 pub use chirp_auth_client::bearer_token;
 
+/// Re-export the machine-token minting module too (client_credentials
+/// `MachineTokenMinter` / `MintConfig`), so a consumer that mints machine tokens
+/// (e.g. murmur) can also drop its direct chirp-auth-client dependency.
+pub use chirp_auth_client::mint;
 /// Re-export the chirp-auth-client verification surface so a relying party that
 /// already depends on `platform-chirp-auth` (for the grant/machine helpers) can
 /// consume the whole ChirpAuth API through THIS crate and drop its own direct
@@ -39,10 +43,6 @@ pub use chirp_auth_client::{
     ChirpVerifiedResourceAccess, ChirpVerifiedToken, Claims, Environment, VerifyOptions,
     ACCESS_TOKEN_TYP, ID_TOKEN_TYP, KEYBIND_TYP,
 };
-/// Re-export the machine-token minting module too (client_credentials
-/// `MachineTokenMinter` / `MintConfig`), so a consumer that mints machine tokens
-/// (e.g. murmur) can also drop its direct chirp-auth-client dependency.
-pub use chirp_auth_client::mint;
 /// Re-export the ChirpAuth event verifier (chirp-auth#87), so a service that
 /// receives Chirp's `user.deleted` webhook needs no direct chirp-auth-client
 /// dependency either (shared-rust#17). The `testkit` feature carries the
@@ -66,7 +66,7 @@ pub mod testkit;
 
 mod authenticator;
 pub use authenticator::{
-    env, AllowlistUnavailable, Authenticated, AuthFailure, Authenticator, Caller, ConfigError,
+    env, AllowlistUnavailable, AuthFailure, Authenticated, Authenticator, Caller, ConfigError,
     MachineAllowlist, Machines, Plane, Policy,
 };
 
@@ -145,9 +145,7 @@ fn validated_id(raw: &str) -> Result<String, ApiError> {
 /// behind its `dev-trusted-headers` feature + `*_TRUSTED_HEADER_AUTH` env flag;
 /// the primitive itself is unconditional so authenticated impersonation works
 /// in release builds.
-pub fn decode_trusted_headers(
-    headers: &http::HeaderMap,
-) -> Result<TrustedHeaderUser, ApiError> {
+pub fn decode_trusted_headers(headers: &http::HeaderMap) -> Result<TrustedHeaderUser, ApiError> {
     let uid_raw = headers
         .get(USER_ID_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -271,7 +269,10 @@ pub async fn apply_on_behalf_of_grant<S: GrantStore + ?Sized>(
     let Ok(grant_id) = Uuid::parse_str(&grant_header) else {
         return Ok(());
     };
-    let grant = match store.lookup_grant_for_subject(grant_id, &ctx.agent_id).await {
+    let grant = match store
+        .lookup_grant_for_subject(grant_id, &ctx.agent_id)
+        .await
+    {
         Ok(Some(grant)) => grant,
         Ok(None) => return Ok(()),
         Err(_) => return Ok(()),
@@ -354,7 +355,9 @@ impl From<VerifyFailure> for ApiError {
     fn from(failure: VerifyFailure) -> Self {
         match failure {
             VerifyFailure::Invalid => ApiError::Unauthorized,
-            VerifyFailure::Unavailable => ApiError::ServiceUnavailable(UNAVAILABLE_MESSAGE.to_owned()),
+            VerifyFailure::Unavailable => {
+                ApiError::ServiceUnavailable(UNAVAILABLE_MESSAGE.to_owned())
+            }
         }
     }
 }
@@ -362,7 +365,6 @@ impl From<VerifyFailure> for ApiError {
 // ---- Shared chirp MACHINE-token verifier --------------------------------
 
 use std::collections::BTreeSet;
-
 
 /// The chirp **machine-token** verifier config plus the explicit `client_id`
 /// allowlist — the single shared replacement for the byte-identical
@@ -486,10 +488,8 @@ impl MachineAuth {
             .map(|id| id.trim().to_owned())
             .filter(|id| !id.is_empty())
             .collect();
-        let config = ChirpAuthConfig::with_audiences(
-            issuer.into(),
-            accepted_client_ids.iter().cloned(),
-        );
+        let config =
+            ChirpAuthConfig::with_audiences(issuer.into(), accepted_client_ids.iter().cloned());
         Self {
             config,
             accepted_client_ids,
@@ -587,36 +587,30 @@ impl MachineAuth {
         client: &reqwest::Client,
         token: &str,
     ) -> Result<VerifiedMachine, MachineAuthError> {
-        let verified = match verify_chirp_id_token(
-            client,
-            &self.config,
-            token,
-            self.verify_options(),
-        )
-        .await
-        {
-            Ok(verified) => verified,
-            // A machine token that verified but whose `client_id` is not in the
-            // accepted set — the lib's definitive non-member rejection. This must
-            // NOT be re-treated as a user token by a fall-through dispatcher.
-            Err(ChirpAuthError::MachineAudienceNotAccepted) => {
-                return Err(MachineAuthError::Rejected);
-            }
-            Err(error) => {
-                return Err(match VerifyFailure::classify(&error) {
-                    // The JWKS could not be fetched (ChirpAuth throttled /
-                    // unreachable): no verdict on the token exists, so this is
-                    // not NotMachine.
-                    VerifyFailure::Unavailable => MachineAuthError::Unavailable,
-                    // Any other verification failure (bad sig / iss / exp / env
-                    // / malformed). A human token from this issuer still
-                    // verifies as `Human` (handled below), so a hard error here
-                    // means the bearer is genuinely not a usable token for this
-                    // issuer — fall-through eligible.
-                    VerifyFailure::Invalid => MachineAuthError::NotMachine,
-                });
-            }
-        };
+        let verified =
+            match verify_chirp_id_token(client, &self.config, token, self.verify_options()).await {
+                Ok(verified) => verified,
+                // A machine token that verified but whose `client_id` is not in the
+                // accepted set — the lib's definitive non-member rejection. This must
+                // NOT be re-treated as a user token by a fall-through dispatcher.
+                Err(ChirpAuthError::MachineAudienceNotAccepted) => {
+                    return Err(MachineAuthError::Rejected);
+                }
+                Err(error) => {
+                    return Err(match VerifyFailure::classify(&error) {
+                        // The JWKS could not be fetched (ChirpAuth throttled /
+                        // unreachable): no verdict on the token exists, so this is
+                        // not NotMachine.
+                        VerifyFailure::Unavailable => MachineAuthError::Unavailable,
+                        // Any other verification failure (bad sig / iss / exp / env
+                        // / malformed). A human token from this issuer still
+                        // verifies as `Human` (handled below), so a hard error here
+                        // means the bearer is genuinely not a usable token for this
+                        // issuer — fall-through eligible.
+                        VerifyFailure::Invalid => MachineAuthError::NotMachine,
+                    });
+                }
+            };
         let environment = verified.environment;
         match verified.identity {
             ChirpVerifiedIdentity::Machine {
@@ -660,7 +654,10 @@ mod tests {
     #[test]
     fn only_an_unfetchable_jwks_is_unavailable() {
         let unavailable = ChirpAuthError::JwksFetch("429".into());
-        assert_eq!(VerifyFailure::from(&unavailable), VerifyFailure::Unavailable);
+        assert_eq!(
+            VerifyFailure::from(&unavailable),
+            VerifyFailure::Unavailable
+        );
         assert!(matches!(
             ApiError::from(VerifyFailure::from(unavailable)),
             ApiError::ServiceUnavailable(_)
@@ -673,7 +670,10 @@ mod tests {
             ChirpAuthError::MissingBearer,
         ] {
             assert_eq!(VerifyFailure::from(&verdict), VerifyFailure::Invalid);
-            assert!(matches!(ApiError::from(VerifyFailure::from(verdict)), ApiError::Unauthorized));
+            assert!(matches!(
+                ApiError::from(VerifyFailure::from(verdict)),
+                ApiError::Unauthorized
+            ));
         }
     }
 
@@ -800,9 +800,11 @@ mod tests {
             agent_id: "human-1".into(), // uid == agent_id => human
             approval_grant_id: None,
         };
-        apply_on_behalf_of_grant(&store, &h, &mut ctx).await.unwrap();
+        apply_on_behalf_of_grant(&store, &h, &mut ctx)
+            .await
+            .unwrap();
         assert_eq!(ctx.uid, "human-1"); // unchanged
-        // header still copied through
+                                        // header still copied through
         assert!(ctx.approval_grant_id.is_some());
     }
 
@@ -813,7 +815,9 @@ mod tests {
             owner: "target-human".into(),
         };
         let (h, mut ctx) = machine_ctx("550e8400-e29b-41d4-a716-446655440000");
-        apply_on_behalf_of_grant(&store, &h, &mut ctx).await.unwrap();
+        apply_on_behalf_of_grant(&store, &h, &mut ctx)
+            .await
+            .unwrap();
         assert_eq!(ctx.uid, "target-human");
         assert_eq!(
             ctx.approval_grant_id.as_deref(),
@@ -828,7 +832,9 @@ mod tests {
             owner: "target-human".into(),
         };
         let (h, mut ctx) = machine_ctx("not-a-uuid");
-        apply_on_behalf_of_grant(&store, &h, &mut ctx).await.unwrap();
+        apply_on_behalf_of_grant(&store, &h, &mut ctx)
+            .await
+            .unwrap();
         assert_eq!(ctx.uid, "owner_sub_from_token"); // unchanged
     }
 
@@ -839,7 +845,9 @@ mod tests {
             owner: "target-human".into(),
         };
         let (h, mut ctx) = machine_ctx("550e8400-e29b-41d4-a716-446655440000");
-        apply_on_behalf_of_grant(&store, &h, &mut ctx).await.unwrap();
+        apply_on_behalf_of_grant(&store, &h, &mut ctx)
+            .await
+            .unwrap();
         assert_eq!(ctx.uid, "owner_sub_from_token"); // unchanged
     }
 
@@ -855,7 +863,9 @@ mod tests {
             agent_id: "agent_machine_sub".into(),
             approval_grant_id: None,
         };
-        apply_on_behalf_of_grant(&store, &h, &mut ctx).await.unwrap();
+        apply_on_behalf_of_grant(&store, &h, &mut ctx)
+            .await
+            .unwrap();
         assert_eq!(ctx.uid, "owner_sub_from_token");
         assert_eq!(ctx.approval_grant_id, None);
     }
@@ -890,8 +900,9 @@ mod machine_auth_config_tests {
         assert!(!options.accepted_machine_audiences.contains("cs_live_other"));
         assert!(!options.accepted_machine_audiences.contains(""));
 
-        let want: BTreeSet<String> =
-            ["cs_live_aaa".to_owned(), "cs_live_bbb".to_owned()].into_iter().collect();
+        let want: BTreeSet<String> = ["cs_live_aaa".to_owned(), "cs_live_bbb".to_owned()]
+            .into_iter()
+            .collect();
         assert_eq!(machine.accepted_client_ids(), &want);
     }
 
@@ -1120,7 +1131,13 @@ mod machine_auth_verify_tests {
             .await
             .expect_err("an unfetchable JWKS cannot verify anything");
         assert_eq!(err, MachineAuthError::Unavailable);
-        assert!(matches!(err.into_api_error(), ApiError::ServiceUnavailable(_)));
-        assert!(matches!(ApiError::from(err), ApiError::ServiceUnavailable(_)));
+        assert!(matches!(
+            err.into_api_error(),
+            ApiError::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            ApiError::from(err),
+            ApiError::ServiceUnavailable(_)
+        ));
     }
 }
