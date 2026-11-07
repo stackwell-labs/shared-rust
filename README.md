@@ -90,6 +90,15 @@ checks against production relying parties: a minimal ES256 WebAuthn
 authenticator with a write-ahead counter, and a browserless driver for
 ChirpAuth's public signup and PKCE sign-in flows. See its README.
 
+### `platform-fcm`
+The one FCM HTTP v1 sender, extracted from Shriek (shared-rust#2): service-account
+parsing that fails at boot on a bad key, the RS256 OAuth mint and cache, and a
+`send` that returns a typed `Delivery` (`Accepted`, `Failed`, `Unregistered`)
+instead of logging and dropping. A `Message` must name its `Priority`, and
+`Priority::High` can only carry a visible notification, so no caller inherits
+FCM's Doze-delayed NORMAL by omission. The `testkit` feature adds a fake FCM
+that verifies the signed assertion. See its README.
+
 ## Building
 
 ```sh
