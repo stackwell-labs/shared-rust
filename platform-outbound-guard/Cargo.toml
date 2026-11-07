@@ -5,7 +5,9 @@ name = "platform-outbound-guard"
 # 0.1.0 is the initial extraction of chirp-auth's webhook SSRF guard.
 # 0.2.0 refuses 6to4 (2002::/16) and 2001::/23 (Teredo included), and bounds
 # resolve_pinned's DNS lookup by DNS_TIMEOUT.
-version = "0.2.0"
+# 0.3.0 adds resolve_pinned_blocking (std resolver, same timeout) and pins a
+# literal-IP host to itself, so Destination::addrs is never empty.
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

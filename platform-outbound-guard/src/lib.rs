@@ -35,11 +35,17 @@
 //! http.post(url).send().await?;
 //! # Ok(()) }
 //! ```
+//!
+//! A synchronous caller (ureq, a wasmtime host import) uses
+//! [`resolve_pinned_blocking`] instead and pins its own client to
+//! [`Destination::addrs`].
 
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 pub use url::Url;
@@ -199,9 +205,11 @@ pub const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 /// A destination that PASSED the guard: the host plus the exact socket
 /// addresses it resolved to, every one of them checked public.
 ///
-/// There is no public constructor other than [`resolve_pinned`], so holding one
-/// of these is proof the check ran. `addrs` is empty when the host was already
-/// a literal IP (nothing to pin — the address itself was checked).
+/// There is no public constructor other than [`resolve_pinned`] and
+/// [`resolve_pinned_blocking`], so holding one of these is proof the check ran.
+/// `addrs` is never empty: a literal-IP host pins its own (checked) address and
+/// the URL's port, so a caller that hands the list to a custom resolver (ureq's
+/// `AgentBuilder::resolver`) works the same for a literal IP as for a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     host: String,
@@ -209,13 +217,26 @@ pub struct Destination {
 }
 
 impl Destination {
+    /// Sort, dedupe and check `addrs`; refuse unless there is at least one and
+    /// EVERY one is public.
+    fn checked(host: String, mut addrs: Vec<SocketAddr>) -> Result<Self, GuardError> {
+        addrs.sort_unstable();
+        addrs.dedup();
+        if addrs.is_empty() {
+            return Err(GuardError::new("host resolved to no addresses"));
+        }
+        for addr in &addrs {
+            ensure_public_ip(addr.ip())?;
+        }
+        Ok(Self { host, addrs })
+    }
+
     /// The URL's host, as it must be sent in `Host:`/SNI.
     pub fn host(&self) -> &str {
         &self.host
     }
 
-    /// The checked socket addresses the connection is pinned to (empty for a
-    /// literal-IP host).
+    /// The checked socket addresses the connection is pinned to. Never empty.
     pub fn addrs(&self) -> &[SocketAddr] {
         &self.addrs
     }
@@ -230,13 +251,41 @@ impl Destination {
     /// The caller adds its own timeouts and headers. Build a fresh client per
     /// attempt so the resolve-and-check is redone on every retry.
     pub fn client_builder(&self) -> reqwest::ClientBuilder {
-        let mut builder = reqwest::Client::builder()
+        // reqwest connects to a literal-IP host without resolving it, so for
+        // one the override goes unused.
+        reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .no_proxy();
-        if !self.addrs.is_empty() {
-            builder = builder.resolve_to_addrs(&self.host, &self.addrs);
+            .no_proxy()
+            .resolve_to_addrs(&self.host, &self.addrs)
+    }
+}
+
+/// What is left to do for a URL that passed [`check_url`].
+enum Pending {
+    /// A literal-IP host: already checked, nothing to resolve.
+    Literal(Destination),
+    /// A domain name that must be resolved, then checked.
+    Lookup { host: String, port: u16 },
+}
+
+impl Pending {
+    fn of(url: &Url) -> Result<Self, GuardError> {
+        check_url(url)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| GuardError::new("URL must include a valid port"))?;
+        let literal = |ip: IpAddr| {
+            Destination::checked(ip.to_string(), vec![SocketAddr::new(ip, port)]).map(Self::Literal)
+        };
+        match url.host() {
+            Some(url::Host::Domain(host)) => Ok(Self::Lookup {
+                host: host.to_owned(),
+                port,
+            }),
+            Some(url::Host::Ipv4(ip)) => literal(IpAddr::V4(ip)),
+            Some(url::Host::Ipv6(ip)) => literal(IpAddr::V6(ip)),
+            None => Err(GuardError::new("URL must include a host")),
         }
-        builder
     }
 }
 
@@ -252,39 +301,37 @@ impl Destination {
 /// racing on which one the connector picks. Resolution is bounded by
 /// [`DNS_TIMEOUT`].
 pub async fn resolve_pinned(url: &Url) -> Result<Destination, GuardError> {
-    check_url(url)?;
-    let host = match url.host() {
-        Some(url::Host::Domain(host)) => host.to_string(),
-        // A literal IP was already checked by `check_url`; there is no DNS step
-        // to pin, and reqwest will connect straight to it.
-        Some(url::Host::Ipv4(ip)) => {
-            return Ok(Destination {
-                host: ip.to_string(),
-                addrs: Vec::new(),
-            });
+    match Pending::of(url)? {
+        Pending::Literal(destination) => Ok(destination),
+        Pending::Lookup { host, port } => {
+            let addrs =
+                lookup_within(tokio::net::lookup_host((host.as_str(), port)), DNS_TIMEOUT).await?;
+            Destination::checked(host, addrs)
         }
-        Some(url::Host::Ipv6(ip)) => {
-            return Ok(Destination {
-                host: ip.to_string(),
-                addrs: Vec::new(),
-            });
+    }
+}
+
+/// [`resolve_pinned`] for synchronous callers (a ureq client, a wasmtime host
+/// import): the same checks and the same [`DNS_TIMEOUT`], resolving with the
+/// system resolver (`std::net::ToSocketAddrs`) instead of tokio. Pin the
+/// client to the result, for ureq
+/// `.resolver(move |_| Ok(destination.addrs().to_vec()))`.
+///
+/// The lookup runs on its own thread so it can be abandoned at the timeout; a
+/// lookup that outlives it finishes (or fails) in the background and its
+/// answer is dropped.
+pub fn resolve_pinned_blocking(url: &Url) -> Result<Destination, GuardError> {
+    match Pending::of(url)? {
+        Pending::Literal(destination) => Ok(destination),
+        Pending::Lookup { host, port } => {
+            let lookup_host = host.clone();
+            let addrs = lookup_blocking_within(
+                move || Ok((lookup_host.as_str(), port).to_socket_addrs()?.collect()),
+                DNS_TIMEOUT,
+            )?;
+            Destination::checked(host, addrs)
         }
-        None => return Err(GuardError::new("URL must include a host")),
-    };
-    let port = url
-        .port_or_known_default()
-        .ok_or_else(|| GuardError::new("URL must include a valid port"))?;
-    let mut addrs =
-        lookup_within(tokio::net::lookup_host((host.as_str(), port)), DNS_TIMEOUT).await?;
-    addrs.sort_unstable();
-    addrs.dedup();
-    if addrs.is_empty() {
-        return Err(GuardError::new("host resolved to no addresses"));
     }
-    for addr in &addrs {
-        ensure_public_ip(addr.ip())?;
-    }
-    Ok(Destination { host, addrs })
 }
 
 /// Await a DNS lookup, refusing it if it fails or takes longer than `timeout`.
@@ -296,12 +343,38 @@ where
     I: Iterator<Item = SocketAddr>,
 {
     match tokio::time::timeout(timeout, lookup).await {
-        Err(_) => Err(GuardError::new(format!(
-            "DNS resolution timed out after {timeout:?}"
-        ))),
+        Err(_) => Err(timed_out(timeout)),
         Ok(Err(e)) => Err(GuardError::new(format!("DNS resolution failed: {e}"))),
         Ok(Ok(addrs)) => Ok(addrs.collect()),
     }
+}
+
+/// Run a blocking DNS lookup on its own thread, refusing it if it fails or
+/// takes longer than `timeout`.
+fn lookup_blocking_within(
+    lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>, GuardError> {
+    let (answer, answered) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("outbound-guard-dns".to_owned())
+        .spawn(move || {
+            // The receiver is gone once the caller has timed out; nothing to do.
+            let _ = answer.send(lookup());
+        })
+        .map_err(|e| GuardError::new(format!("DNS resolution failed: no resolver thread: {e}")))?;
+    match answered.recv_timeout(timeout) {
+        Ok(Ok(addrs)) => Ok(addrs),
+        Ok(Err(e)) => Err(GuardError::new(format!("DNS resolution failed: {e}"))),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(timed_out(timeout)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(GuardError::new(
+            "DNS resolution failed: the resolver thread panicked",
+        )),
+    }
+}
+
+fn timed_out(timeout: Duration) -> GuardError {
+    GuardError::new(format!("DNS resolution timed out after {timeout:?}"))
 }
 
 #[cfg(test)]
@@ -465,15 +538,66 @@ mod tests {
         }
     }
 
+    /// A literal-IP host is pinned to itself and the URL's port, by both
+    /// resolvers, so a custom resolver handed `addrs()` (ureq's) never gets an
+    /// empty list.
     #[tokio::test]
-    async fn resolve_pinned_accepts_a_literal_public_ip_without_pinning() {
-        let url = validate_url("https://1.1.1.1/x").unwrap();
-        let destination = resolve_pinned(&url).await.unwrap();
-        assert_eq!(destination.host(), "1.1.1.1");
-        assert!(
-            destination.addrs().is_empty(),
-            "a literal IP needs no DNS pin"
+    async fn a_literal_public_ip_pins_itself_and_the_port() {
+        for (raw, host, pin) in [
+            (
+                "https://1.1.1.1/x",
+                "1.1.1.1",
+                SocketAddr::from(([1, 1, 1, 1], 443)),
+            ),
+            (
+                "https://[2606:4700:4700::1111]:8443/x",
+                "2606:4700:4700::1111",
+                SocketAddr::new(v6("2606:4700:4700::1111"), 8443),
+            ),
+        ] {
+            let url = validate_url(raw).unwrap();
+            for destination in [
+                resolve_pinned(&url).await.unwrap(),
+                resolve_pinned_blocking(&url).unwrap(),
+            ] {
+                assert_eq!(destination.host(), host);
+                assert_eq!(destination.addrs(), [pin], "{raw}");
+            }
+        }
+    }
+
+    /// A name's answer is pinned whole: sorted, deduped, every address kept.
+    /// Stubbed, since the one name every box resolves (`localhost`) is
+    /// refused by policy.
+    #[test]
+    fn a_blocking_lookup_returns_its_answer_and_pins_it() {
+        let answer = vec![
+            SocketAddr::from(([8, 8, 8, 8], 443)),
+            SocketAddr::from(([1, 1, 1, 1], 443)),
+            SocketAddr::from(([8, 8, 8, 8], 443)),
+        ];
+        let stub = answer.clone();
+        let addrs = lookup_blocking_within(move || Ok(stub), DNS_TIMEOUT).unwrap();
+        assert_eq!(addrs, answer);
+        let destination = Destination::checked("app.example".to_owned(), addrs).unwrap();
+        assert_eq!(
+            destination.addrs(),
+            [
+                SocketAddr::from(([1, 1, 1, 1], 443)),
+                SocketAddr::from(([8, 8, 8, 8], 443)),
+            ],
+            "sorted, deduped, every address kept"
         );
+    }
+
+    #[test]
+    fn a_name_answering_with_any_internal_address_is_refused() {
+        let mixed = vec![
+            SocketAddr::from(([8, 8, 8, 8], 443)),
+            SocketAddr::from(([169, 254, 169, 254], 443)),
+        ];
+        assert!(Destination::checked("app.example".to_owned(), mixed).is_err());
+        assert!(Destination::checked("app.example".to_owned(), Vec::new()).is_err());
     }
 
     /// THE POINT OF THE CRATE. `localhost` is a DOMAIN, so it survives every
@@ -523,6 +647,48 @@ mod tests {
             .await
             .expect_err("a hung lookup must be refused");
         assert!(err.to_string().contains("timed out"), "got: {err}");
+    }
+
+    /// The blocking resolver catches the same rebinding shape: `localhost`
+    /// passes every syntactic check and is refused only once resolved.
+    #[test]
+    fn blocking_refuses_a_hostname_that_resolves_to_an_internal_address() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = validate_url(&format!("https://localhost:{port}/hook")).unwrap();
+        let err = resolve_pinned_blocking(&url)
+            .expect_err("a hostname resolving to loopback must be refused");
+        assert!(err.to_string().contains("non-public"), "got: {err}");
+        assert!(
+            listener.accept().is_err(),
+            "the guard must refuse BEFORE connecting — the listener saw nothing"
+        );
+    }
+
+    #[test]
+    fn a_blocking_lookup_that_never_answers_times_out() {
+        let started = std::time::Instant::now();
+        let err = lookup_blocking_within(
+            || {
+                thread::sleep(Duration::from_secs(5));
+                Ok(Vec::new())
+            },
+            Duration::from_millis(20),
+        )
+        .expect_err("a hung lookup must be refused");
+        assert!(err.to_string().contains("timed out"), "got: {err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it must not wait for the lookup"
+        );
+    }
+
+    #[test]
+    fn a_blocking_lookup_failure_is_refused() {
+        let err = lookup_blocking_within(|| Err(io::Error::other("NXDOMAIN")), DNS_TIMEOUT)
+            .expect_err("a failed lookup must be refused");
+        assert!(err.to_string().contains("NXDOMAIN"), "got: {err}");
     }
 
     /// The pinned builder actually produces a usable client, and the pin is
