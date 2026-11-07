@@ -23,7 +23,9 @@ use base64::Engine;
 use chirp_auth_client::{
     verify_chirp_id_token, ChirpAuthConfig, ChirpVerifiedIdentity, VerifyOptions,
 };
-use platform_synthetic_user::{Error, FileStore, Issuer, PublicClient, StateStore, SyntheticUser};
+use platform_synthetic_user::{
+    Error, FileStore, Issuer, PublicClient, StateStore, SyntheticUser, UserState,
+};
 use serde_json::{json, Value};
 
 /// The fixed control token of chirp-auth's local issuer (`local_serve.rs`).
@@ -143,9 +145,9 @@ async fn verified_sub(issuer: &str, signed_in: &platform_synthetic_user::SignIn)
     sub
 }
 
-fn scratch_dir() -> PathBuf {
+fn scratch_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("synthetic-user-{}", std::process::id()));
+        .join(format!("synthetic-user-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -157,7 +159,7 @@ async fn synthetic_user_enrolls_signs_in_and_cannot_replay_a_counter() {
     let local = start_issuer().await;
     let issuer = local.issuer.clone();
     register_public_client(&issuer).await;
-    let dir = scratch_dir();
+    let dir = scratch_dir("journey");
     let live = dir.join("user.json");
 
     // 1. Enroll: a real ChirpAuth One account via the public signup ceremony.
@@ -241,4 +243,169 @@ async fn synthetic_user_enrolls_signs_in_and_cannot_replay_a_counter() {
     eprintln!("sign-in 3 with the genuine state: same sub, counter 3");
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+async fn enroll(issuer: &str, live: &std::path::Path) {
+    SyntheticUser::enroll(
+        Issuer::new(issuer).unwrap(),
+        "Synthetic rotation",
+        FileStore::new(live),
+    )
+    .await
+    .expect("enroll");
+}
+
+async fn load<S: StateStore>(issuer: &str, store: S) -> SyntheticUser<S> {
+    SyntheticUser::load(Issuer::new(issuer).unwrap(), store)
+        .await
+        .expect("load")
+}
+
+async fn sub_of(issuer: &str, live: &std::path::Path) -> String {
+    let mut user = load(issuer, FileStore::new(live)).await;
+    verified_sub(issuer, &user.sign_in(&client()).await.expect("sign-in")).await
+}
+
+fn credential_id(state: &UserState) -> Vec<u8> {
+    state.credential().credential_id().to_vec()
+}
+
+/// A key the issuer no longer holds is refused. ChirpAuth's sign-in start
+/// names the account's credentials; once the old one is gone it is not named,
+/// so the authenticator refuses before any assertion leaves (as a browser
+/// would, with no matching passkey).
+async fn assert_refused(issuer: &str, stale: &std::path::Path) {
+    let mut user = load(issuer, FileStore::new(stale)).await;
+    match user.sign_in(&client()).await {
+        Err(Error::Authenticator(why)) => {
+            assert!(
+                why.contains("allowCredentials"),
+                "refused for the key: {why}"
+            )
+        }
+        other => panic!("the old key must be refused, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn synthetic_user_rotates_its_passkey_in_place() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    register_public_client(&issuer).await;
+    let dir = scratch_dir("rotate");
+    let live = dir.join("user.json");
+    let stale = dir.join("before.json");
+
+    enroll(&issuer, &live).await;
+    let sub = sub_of(&issuer, &live).await;
+    std::fs::copy(&live, &stale).unwrap();
+    let before = FileStore::new(&stale).load().await.unwrap().unwrap();
+
+    // Rotate: a new passkey on the same account, the old one removed.
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    user.rotate_passkey().await.expect("rotate");
+    let after = FileStore::new(&live).load().await.unwrap().unwrap();
+    assert!(!after.is_rotating(), "the rotation finished");
+    assert_ne!(credential_id(&after), credential_id(&before), "a new key");
+    assert_eq!(
+        after.account().unwrap().account_id,
+        before.account().unwrap().account_id,
+        "the same account"
+    );
+    eprintln!("rotated {}", after.account().unwrap().account_id);
+
+    // The new key signs in as the same user; the old one is refused.
+    assert_eq!(sub_of(&issuer, &live).await, sub, "same account, same sub");
+    assert_refused(&issuer, &stale).await;
+    eprintln!("new key signs in to the same sub; the old key is refused");
+
+    // Rotation left exactly one passkey: a second one starts from there.
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    user.rotate_passkey().await.expect("rotate again");
+    assert_eq!(sub_of(&issuer, &live).await, sub);
+    eprintln!("rotated again: same sub");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The crash model: every save is durable, and the process dies right after
+/// save number `crash_at` (so nothing after it is sent).
+struct CrashAfter {
+    inner: FileStore,
+    saves_left: usize,
+}
+
+impl StateStore for CrashAfter {
+    async fn load(&self) -> Result<Option<UserState>, Error> {
+        self.inner.load().await
+    }
+
+    async fn save(&mut self, state: &UserState) -> Result<(), Error> {
+        assert!(self.saves_left > 0, "nothing runs after the crash");
+        self.inner.save(state).await?;
+        self.saves_left -= 1;
+        if self.saves_left == 0 {
+            return Err(std::io::Error::other("simulated crash after a durable save").into());
+        }
+        Ok(())
+    }
+}
+
+/// A rotation saves five times: the old key's sign-in counter, the new key
+/// (before its registration is sent), the new key's first counter, its
+/// promotion, and the end. Cut it short after each, then resume from what
+/// the store holds: the account always signs in as the same user, and once
+/// the new key was registered it ends up the only one.
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn a_rotation_cut_short_at_any_save_resumes_from_the_store() {
+    for crash_at in 1..=5 {
+        // A fresh issuer each round keeps every round inside the issuer's
+        // per-IP sign-in rate limit.
+        let local = start_issuer().await;
+        let issuer = local.issuer.clone();
+        register_public_client(&issuer).await;
+        let dir = scratch_dir(&format!("crash-{crash_at}"));
+        let live = dir.join("user.json");
+        let stale = dir.join("before.json");
+        enroll(&issuer, &live).await;
+        let sub = sub_of(&issuer, &live).await;
+        std::fs::copy(&live, &stale).unwrap();
+        let before = FileStore::new(&stale).load().await.unwrap().unwrap();
+
+        let mut user = load(
+            &issuer,
+            CrashAfter {
+                inner: FileStore::new(&live),
+                saves_left: crash_at,
+            },
+        )
+        .await;
+        let crashed = user.rotate_passkey().await;
+        assert!(
+            matches!(crashed, Err(Error::Store(_))),
+            "crash after save {crash_at}: {crashed:?}"
+        );
+        drop(user);
+
+        let mut user = load(&issuer, FileStore::new(&live)).await;
+        let resumed = user.state().is_rotating();
+        if resumed {
+            user.rotate_passkey().await.expect("resume the rotation");
+        }
+        let after = FileStore::new(&live).load().await.unwrap().unwrap();
+        assert!(!after.is_rotating());
+        assert_eq!(sub_of(&issuer, &live).await, sub, "crash at {crash_at}");
+        if crash_at == 1 {
+            // Cut short before the new key existed: nothing changed.
+            assert!(!resumed);
+            assert_eq!(credential_id(&after), credential_id(&before));
+        } else {
+            assert_ne!(credential_id(&after), credential_id(&before));
+            assert_refused(&issuer, &stale).await;
+        }
+        eprintln!("crash after save {crash_at}: resumed={resumed}, same sub");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

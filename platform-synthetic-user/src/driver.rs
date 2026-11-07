@@ -20,12 +20,19 @@ use crate::authenticator::{
     b64_encode, random_bytes, CreationOptions, Credential, RequestOptions, WebOrigin,
 };
 use crate::error::protocol;
-use crate::state::{Account, StateStore, UserState};
+use crate::state::{Account, Key, Rotation, StateStore, UserState};
 use crate::Error;
 
 /// The header ChirpAuth's `/authorize` login page carries its login id in;
 /// the same id is the page's hidden `login_id` input.
 const LOGIN_ID_HEADER: &str = "x-chirp-auth-login-id";
+/// ChirpAuth's browser session cookie, which its account surface reads.
+const SESSION_COOKIE: &str = "chirp_auth_session";
+/// The path ChirpAuth's passkey list links each passkey's remove page under:
+/// `/account/passkeys/{passkey_id}/remove`.
+const PASSKEY_PATH: &str = "/account/passkeys/";
+/// The empty form a bodiless POST from a hosted page submits.
+const NO_FORM: &[(&str, &str)] = &[];
 const MAX_ERROR_BODY: usize = 300;
 
 /// A ChirpAuth issuer, addressed the way a browser reaches it.
@@ -71,39 +78,50 @@ impl Issuer {
         Url::parse(&format!("{}{path}", self.issuer)).expect("issuer joins a path")
     }
 
+    /// A POST as the hosted pages' scripts send it: from the issuer's own
+    /// origin (which is also what passes ChirpAuth's CSRF gate for a
+    /// cookie-bearing request), carrying the account session if there is one.
+    fn post(&self, url: Url, session: Option<&AccountSession>) -> reqwest::RequestBuilder {
+        let request = self.http.post(url).header("origin", self.issuer.as_str());
+        match session {
+            Some(session) => request.header("cookie", &session.cookie),
+            None => request,
+        }
+    }
+
     async fn post_form<T: DeserializeOwned>(
         &self,
         step: &'static str,
         path: &str,
+        session: Option<&AccountSession>,
         form: &[(&str, &str)],
     ) -> Result<T, Error> {
-        let response = self
-            .http
-            .post(self.url(path))
-            .header("origin", self.issuer.as_str())
-            .form(form)
-            .send()
-            .await?;
+        let response = self.post(self.url(path), session).form(form).send().await?;
         json_ok(step, response).await
+    }
+
+    async fn post_ceremony(
+        &self,
+        path: &str,
+        session: Option<&AccountSession>,
+        ceremony_id: &str,
+        body: &Value,
+    ) -> Result<Response, Error> {
+        let mut url = self.url(path);
+        url.query_pairs_mut()
+            .append_pair("ceremony_id", ceremony_id);
+        Ok(self.post(url, session).json(body).send().await?)
     }
 
     async fn post_json<T: DeserializeOwned>(
         &self,
         step: &'static str,
         path: &str,
+        session: Option<&AccountSession>,
         ceremony_id: &str,
         body: &Value,
     ) -> Result<T, Error> {
-        let mut url = self.url(path);
-        url.query_pairs_mut()
-            .append_pair("ceremony_id", ceremony_id);
-        let response = self
-            .http
-            .post(url)
-            .header("origin", self.issuer.as_str())
-            .json(body)
-            .send()
-            .await?;
+        let response = self.post_ceremony(path, session, ceremony_id, body).await?;
         json_ok(step, response).await
     }
 }
@@ -144,6 +162,11 @@ struct SignupFinished {
     persona_id: String,
     #[serde(default)]
     recovery_codes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct Status {
+    status: String,
 }
 
 #[derive(Deserialize)]
@@ -197,6 +220,7 @@ impl<S: StateStore> SyntheticUser<S> {
             .post_form(
                 "signup start",
                 "/signup/passkey/start",
+                None,
                 &[("display_name", display_name)],
             )
             .await?;
@@ -208,6 +232,7 @@ impl<S: StateStore> SyntheticUser<S> {
             .post_json(
                 "signup finish",
                 "/signup/passkey/finish",
+                None,
                 &ceremony.ceremony_id,
                 &registration,
             )
@@ -312,6 +337,7 @@ impl<S: StateStore> SyntheticUser<S> {
             .post_form(
                 "passkey start",
                 "/login/passkey/start",
+                None,
                 &[
                     ("login_id", &login_id),
                     ("account_id", &self.account.account_id),
@@ -320,13 +346,19 @@ impl<S: StateStore> SyntheticUser<S> {
             .await?;
         let assertion = self
             .state
-            .next_assertion(&mut self.store, &self.issuer.origin, &ceremony.options)
+            .next_assertion(
+                &mut self.store,
+                Key::Current,
+                &self.issuer.origin,
+                &ceremony.options,
+            )
             .await?;
         let finished: SigninFinished = self
             .issuer
             .post_json(
                 "passkey finish",
                 "/login/passkey/finish",
+                None,
                 &ceremony.ceremony_id,
                 &assertion,
             )
@@ -426,6 +458,289 @@ impl<S: StateStore> SyntheticUser<S> {
             token_response,
         })
     }
+
+    /// Rotate this account's passkey in place: register a new software
+    /// passkey on the account, sign in with it once, then remove the old one.
+    /// The account, its id and every grant keyed on it stay as they were;
+    /// afterwards the old key is refused and the new one signs in.
+    ///
+    /// This uses ChirpAuth's own account surface, as a person adding and
+    /// removing a passkey there would: a passkey sign-in with no relying
+    /// party, `/passkeys/register/{start,finish}`, and the passkey list's
+    /// remove form.
+    ///
+    /// The account must hold exactly one passkey, this user's: rotation
+    /// replaces it and touches nothing else. The new key is saved beside the
+    /// old one before its registration is sent, and replaces it in the store
+    /// only after the issuer has accepted a sign-in from it, so the store
+    /// always holds a key the account accepts. A rotation cut short at any
+    /// step (see [`UserState::is_rotating`]) is finished by calling this
+    /// again, from the same store.
+    pub async fn rotate_passkey(&mut self) -> Result<(), Error> {
+        let mut session = None;
+        if self.state.rotation().is_none() {
+            self.register_next().await?;
+        }
+        if let Some(Rotation::Registering { .. }) = self.state.rotation() {
+            session = match self.prove_next().await? {
+                Some(session) => Some(session),
+                None => {
+                    // The new key was saved but the issuer never registered
+                    // it (its finish failed or never arrived). Nothing on the
+                    // account refers to it, so drop it and register afresh.
+                    self.state.abandon_rotation()?;
+                    self.store.save(&self.state).await?;
+                    self.register_next().await?;
+                    Some(self.prove_next().await?.ok_or_else(|| {
+                        protocol(
+                            "rotate",
+                            "the issuer does not offer the passkey it just registered",
+                        )
+                    })?)
+                }
+            };
+        }
+        let Some(Rotation::Retiring { retire }) = self.state.rotation().cloned() else {
+            return Err(Error::State("rotation is not retiring the old key".into()));
+        };
+        let session = match session {
+            Some(session) => session,
+            None => self.account_session(Key::Current).await?,
+        };
+        session.remove_passkey(&self.issuer, &retire).await?;
+        // ChirpAuth answers an unknown id with the same redirect as a removal,
+        // so the list is the proof.
+        let left = session.passkey_ids(&self.issuer).await?;
+        if left.contains(&retire) || left.len() != 1 {
+            return Err(protocol(
+                "passkey remove",
+                format!(
+                    "after removing {retire} the account holds {} passkeys{}",
+                    left.len(),
+                    if left.contains(&retire) {
+                        ", the old one among them"
+                    } else {
+                        ""
+                    }
+                ),
+            ));
+        }
+        self.state.finish_rotation()?;
+        self.store.save(&self.state).await?;
+        session.sign_out(&self.issuer).await
+    }
+
+    /// Register a new key beside the current one, saving it first.
+    async fn register_next(&mut self) -> Result<(), Error> {
+        let session = self.account_session(Key::Current).await?;
+        let ids = session.passkey_ids(&self.issuer).await?;
+        let [retire] = ids.as_slice() else {
+            return Err(Error::State(format!(
+                "the account holds {} passkeys; rotation replaces exactly one",
+                ids.len()
+            )));
+        };
+        let ceremony: Ceremony<CreationOptions> = self
+            .issuer
+            .post_form(
+                "passkey register start",
+                "/passkeys/register/start",
+                Some(&session),
+                NO_FORM,
+            )
+            .await?;
+        let (next, registration) = Credential::register(&self.issuer.origin, &ceremony.options)?;
+        if next.user_handle() != self.state.credential().user_handle() {
+            return Err(protocol(
+                "passkey register start",
+                "the new passkey would answer for another account",
+            ));
+        }
+        self.state.begin_rotation(next, retire.clone())?;
+        self.store.save(&self.state).await?;
+        let finished: Status = self
+            .issuer
+            .post_json(
+                "passkey register finish",
+                "/passkeys/register/finish",
+                Some(&session),
+                &ceremony.ceremony_id,
+                &registration,
+            )
+            .await?;
+        if finished.status != "registered" {
+            return Err(protocol(
+                "passkey register finish",
+                format!("status {:?}", finished.status),
+            ));
+        }
+        session.sign_out(&self.issuer).await
+    }
+
+    /// Sign in with the registering new key and promote it. `None` if the
+    /// issuer does not offer that key for this account, i.e. never
+    /// registered it.
+    async fn prove_next(&mut self) -> Result<Option<AccountSession>, Error> {
+        let ceremony = self.start_account_sign_in().await?;
+        let Some(Rotation::Registering { next, .. }) = self.state.rotation() else {
+            return Err(Error::State("no new key is registering".into()));
+        };
+        match ceremony.options.names(next.credential_id()) {
+            Some(true) => {}
+            Some(false) => return Ok(None),
+            None => {
+                return Err(protocol(
+                    "account sign-in start",
+                    "the ceremony names no credentials",
+                ))
+            }
+        }
+        let session = self.finish_account_sign_in(ceremony, Key::Next).await?;
+        self.state.promote_next()?;
+        self.store.save(&self.state).await?;
+        Ok(Some(session))
+    }
+
+    /// Sign in to ChirpAuth itself (no relying party) with `key`.
+    async fn account_session(&mut self, key: Key) -> Result<AccountSession, Error> {
+        let ceremony = self.start_account_sign_in().await?;
+        self.finish_account_sign_in(ceremony, key).await
+    }
+
+    async fn start_account_sign_in(&self) -> Result<Ceremony<RequestOptions>, Error> {
+        // No `login_id`: a sign-in to the account, which ends in a session
+        // rather than a code for an app.
+        self.issuer
+            .post_form(
+                "account sign-in start",
+                "/login/passkey/start",
+                None,
+                &[("account_id", &self.account.account_id)],
+            )
+            .await
+    }
+
+    async fn finish_account_sign_in(
+        &mut self,
+        ceremony: Ceremony<RequestOptions>,
+        key: Key,
+    ) -> Result<AccountSession, Error> {
+        let step = "account sign-in finish";
+        let assertion = self
+            .state
+            .next_assertion(&mut self.store, key, &self.issuer.origin, &ceremony.options)
+            .await?;
+        let response = self
+            .issuer
+            .post_ceremony(
+                "/login/passkey/finish",
+                None,
+                &ceremony.ceremony_id,
+                &assertion,
+            )
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(rejected(step, response).await);
+        }
+        let cookie =
+            session_cookie(&response).ok_or_else(|| protocol(step, "no session cookie was set"))?;
+        let finished: Status = json_ok(step, response).await?;
+        if finished.status != "signed_in" {
+            return Err(protocol(step, format!("status {:?}", finished.status)));
+        }
+        Ok(AccountSession { cookie })
+    }
+}
+
+/// A signed-in session on ChirpAuth's own account surface. `Debug` is not
+/// derived: the cookie is a bearer secret.
+struct AccountSession {
+    /// `chirp_auth_session=<token>`, as a `Cookie` header carries it.
+    cookie: String,
+}
+
+impl AccountSession {
+    /// The issuer's ids of the account's passkeys, read off the passkey list
+    /// page: the hosted page is the only listing a session can read, and its
+    /// remove links are what a person follows to remove one.
+    async fn passkey_ids(&self, issuer: &Issuer) -> Result<Vec<String>, Error> {
+        let step = "passkey list";
+        let response = issuer
+            .http
+            .get(issuer.url("/account/passkeys"))
+            .header("cookie", &self.cookie)
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(rejected(step, response).await);
+        }
+        let ids = passkey_ids(&response.text().await?);
+        if ids.is_empty() {
+            return Err(protocol(step, "the page lists no passkeys"));
+        }
+        Ok(ids)
+    }
+
+    /// Submit the passkey list's remove form for `passkey_id`.
+    async fn remove_passkey(&self, issuer: &Issuer, passkey_id: &str) -> Result<(), Error> {
+        let response = issuer
+            .post(
+                issuer.url(&format!("{PASSKEY_PATH}{passkey_id}/remove")),
+                Some(self),
+            )
+            .form(NO_FORM)
+            .send()
+            .await?;
+        if !response.status().is_redirection() {
+            return Err(rejected("passkey remove", response).await);
+        }
+        Ok(())
+    }
+
+    /// End the session, so no live session outlasts the rotation.
+    async fn sign_out(self, issuer: &Issuer) -> Result<(), Error> {
+        let response = issuer
+            .post(issuer.url("/logout"), Some(&self))
+            .form(NO_FORM)
+            .send()
+            .await?;
+        if !(response.status() == StatusCode::OK || response.status().is_redirection()) {
+            return Err(rejected("sign out", response).await);
+        }
+        Ok(())
+    }
+}
+
+/// The `name=value` of ChirpAuth's session cookie, from a response's
+/// `Set-Cookie` headers.
+fn session_cookie(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|cookie| {
+            let pair = cookie.split(';').next()?.trim();
+            let (name, value) = pair.split_once('=')?;
+            (name == SESSION_COOKIE && !value.is_empty()).then(|| pair.to_string())
+        })
+}
+
+/// Every `{id}` in a `/account/passkeys/{id}/remove` link, in page order,
+/// each once.
+fn passkey_ids(html: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    for (at, _) in html.match_indices(PASSKEY_PATH) {
+        let rest = &html[at + PASSKEY_PATH.len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+            .unwrap_or(rest.len());
+        let (id, tail) = rest.split_at(end);
+        if !id.is_empty() && tail.starts_with("/remove") && !ids.iter().any(|known| known == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
 }
 
 /// `error` and `error_description` of an error redirect, for the message.
@@ -439,4 +754,19 @@ fn error_of(location: &str) -> String {
         params.get("error"),
         params.get("error_description")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passkey_ids_come_from_the_remove_links_once_each() {
+        let page = r#"<a href="/account/passkeys/add">ADD</a>
+            <a href="/account/passkeys/pk_1a/rename">RENAME</a><a href="/account/passkeys/pk_1a/remove">REMOVE</a>
+            <a href="/account/passkeys/pk_2b/rename">RENAME</a><a href="/account/passkeys/pk_2b/remove">REMOVE</a>
+            <form action="/account/passkeys/pk_2b/remove"></form>"#;
+        assert_eq!(passkey_ids(page), vec!["pk_1a", "pk_2b"]);
+        assert!(passkey_ids("<p>No passkeys yet</p>").is_empty());
+    }
 }

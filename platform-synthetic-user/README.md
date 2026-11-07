@@ -25,6 +25,25 @@ sequenceDiagram
     D->>C: POST /token (public client) → id_token
 ```
 
+Rotation replaces the key on the same account, so its id, its `sub` at each
+app and every grant keyed on it stay put:
+
+```mermaid
+sequenceDiagram
+    participant D as SyntheticUser
+    participant S as StateStore
+    participant C as ChirpAuth
+    D->>C: account sign-in with the old key (no app)
+    D->>C: GET /account/passkeys → the one passkey id to retire
+    D->>C: POST /passkeys/register/start
+    D->>S: save the new key beside the old (before sending it)
+    D->>C: POST /passkeys/register/finish
+    D->>C: account sign-in with the new key
+    D->>S: new key becomes the key in use
+    D->>C: POST /account/passkeys/{old}/remove, then re-read the list
+    D->>S: rotation done
+```
+
 ## API
 
 - `Issuer::new(url)`: `https`, or `http` on loopback only.
@@ -35,6 +54,9 @@ sequenceDiagram
   a server-side RP's login redirect) and returns the RP callback URL.
 - `user.sign_in(&PublicClient)`: the whole public-client flow, returning the
   `id_token` and the `nonce` to check. Verify the token with the RP's verifier.
+- `user.rotate_passkey()`: a new key on the same account, the old one
+  removed. The account must hold exactly one passkey. If it is cut short,
+  `state().is_rotating()` is true and calling it again finishes it.
 - `StateStore` (`load`, `save`); `FileStore` writes atomically with mode 0600.
 
 ## Guarantees
@@ -42,6 +64,11 @@ sequenceDiagram
 - **Counter is write-ahead.** An assertion is released only after the counter
   it carries is saved, so a failure, a refusal or a crash never leaves the
   stored counter behind the issuer's. A failed save sends nothing.
+- **Rotation never strands the account.** The new key is saved beside the
+  old before its registration is sent, and replaces it in the store only
+  after ChirpAuth accepts a sign-in from it; the old passkey is removed last.
+  A rotation cut short at any save resumes from the store. A state saved
+  mid-rotation can't be read by a version before 0.2.0 (it refuses loudly).
 - **rpId is the issuer's exact host**, as ChirpAuth derives it; anything
   else is refused, like a browser would.
 - **Only public flows.** The same requests the hosted signup and sign-in
@@ -59,7 +86,13 @@ handles (chirp-auth's own tests note this).
 `tests/local_issuer.rs` runs against chirp-auth's local issuer: enroll, sign
 in, verify the `id_token` on the local JWKS with `chirp-auth-client`, sign in
 again for the same `sub`, and show a stale copy of the state (a repeated
-counter) refused while the genuine state still signs in.
+counter) refused while the genuine state still signs in. It also rotates the
+key (same `sub` after, old key refused, a second rotation works), and cuts a
+rotation short after each of its five saves and resumes it.
+
+The rotation finds the passkey to remove on the hosted passkey list page
+(its remove links), the only listing a session can read; a change to that
+page's links fails the rotation loudly, here and in CI.
 
 ```sh
 # in a chirpauth/server-dev checkout
