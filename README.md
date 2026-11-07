@@ -59,6 +59,15 @@ guarantee — a hostname that passed it can later resolve to 169.254.169.254. Ex
 chirp-auth's `messaging.rs`; granite previously carried a create-time-only
 denylist with no resolution at all.
 
+### `platform-secrets`
+The one secret loader for `adr-secret-storage`: `load::<S>(secret_id_env)` does
+one `GetSecretValue` and deserializes the service's JSON secret into its own
+typed struct. No value can reach an error or a log line. Blank means absent,
+undeclared keys are set aside by name, and every failure refuses boot,
+including a plaintext env copy of a `Secret`. There is no env source;
+`from_file` is for local runs. It ships `scripts/put-config-key.sh`. See its
+README.
+
 ### `platform-synthetic-user`
 A real ChirpAuth account driven by a software passkey, for unattended live
 checks against production relying parties: a minimal ES256 WebAuthn
