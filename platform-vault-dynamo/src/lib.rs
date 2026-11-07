@@ -214,15 +214,21 @@ impl VaultClient {
     /// so a caller could append a `Delete` after the fact and the item type would
     /// guarantee nothing — a guard that looks armed and is not. Taking the items
     /// and sending is what makes `Delete` genuinely unrepresentable here.
+    ///
+    /// The error is boxed because the SDK's is large (clippy's
+    /// `result_large_err`, shared-rust#25), and it is only built on failure.
+    /// Callers still see the SDK error through `Deref`: `e.as_service_error()`
+    /// and a `&SdkError` parameter take `&e` unchanged.
     pub async fn transact_write(
         &self,
         items: impl IntoIterator<Item = VaultTransactItem>,
-    ) -> Result<TransactWriteItemsOutput, SdkError<TransactWriteItemsError, HttpResponse>> {
+    ) -> Result<TransactWriteItemsOutput, Box<SdkError<TransactWriteItemsError, HttpResponse>>>
+    {
         let mut req = self.inner.transact_write_items();
         for item in items {
             req = req.transact_items(item.into());
         }
-        req.send().await
+        req.send().await.map_err(Box::new)
     }
 
     // Deliberately absent: delete_item, batch_write_item (its DeleteRequest is
