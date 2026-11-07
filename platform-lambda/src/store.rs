@@ -71,11 +71,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use tokio::sync::Mutex;
 
     // Guards process-global env-var mutation so the two tests below can't race
     // each other on the same key (cargo runs tests in parallel by default).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // An async lock: it's held across `select_dynamo_or_memory(..).await`,
+    // whose config load reads the environment.
+    static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[derive(Debug, PartialEq, Eq)]
     enum FakeStore {
@@ -85,7 +87,7 @@ mod tests {
 
     #[tokio::test]
     async fn selects_memory_when_env_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         let key = "PLATFORM_LAMBDA_TEST_SELECT_TABLE_UNSET";
         // SAFETY: serialized by ENV_LOCK; no other thread reads/writes this key.
         unsafe { std::env::remove_var(key) };
@@ -108,7 +110,7 @@ mod tests {
     // constructor.
     #[tokio::test]
     async fn selects_dynamo_and_threads_table_name_when_env_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         let key = "PLATFORM_LAMBDA_TEST_SELECT_TABLE_SET";
         // SAFETY: serialized by ENV_LOCK; no other thread reads/writes this key.
         unsafe { std::env::set_var(key, "my-table") };
