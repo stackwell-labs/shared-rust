@@ -1,8 +1,8 @@
 //! Drives `scripts/put-config-key.sh` against a fake `aws` that keeps the
 //! secret in a file, and checks that it writes what it should and never
 //! prints a value. Needs bash and jq, as the script does. amber-ci's image has
-//! no jq, and adding it means changing a required job, which needs the owner
-//! (shared-rust#13), so these are ignored by default: run them with
+//! no jq, so these are ignored by default and amber-ci's `script-tests` job,
+//! which installs jq, runs them (shared-rust#13). Locally:
 //! `cargo test -p platform-secrets --test put_config_key -- --ignored`.
 
 use std::io::Write;

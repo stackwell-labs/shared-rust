@@ -62,6 +62,33 @@ exclude = ["**/*.md", ".github/**"]
 CARGO_HOME = "/cache/cargo"
 CARGO_TARGET_DIR = "/cache/target"
 
+[job.script-tests]
+# platform-secrets' test of scripts/put-config-key.sh (no value in output or
+# argv) needs jq, which the image lacks, so the test is #[ignore]d and `test`
+# skips it. This job installs jq and runs only the ignored tests of that file.
+# A job of its own, not a step of `test`: editing a required job's definition
+# needs the owner's approval at main's gate (amber-ci#8), and adding a job does
+# not (shared-rust#13). It has no GitHub counterpart.
+image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
+fetch = [
+  "apt-get update -qq && apt-get install -y -qq --no-install-recommends jq",
+  "cargo fetch --locked",
+]
+run = [
+  "cargo test -p platform-secrets --test put_config_key --locked --offline -- --ignored",
+]
+required_for_main = false
+reuse = true
+timeout_minutes = 30
+cache = "rust-1.97.0"
+
+[job.script-tests.inputs]
+exclude = ["**/*.md", ".github/**"]
+
+[job.script-tests.env]
+CARGO_HOME = "/cache/cargo"
+CARGO_TARGET_DIR = "/cache/target"
+
 [job.audit]
 image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
 # Nightly, not on every push (2026-11-05): an advisory published today must not
