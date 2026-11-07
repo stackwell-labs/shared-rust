@@ -37,7 +37,10 @@
 //! ```
 
 use std::fmt;
+use std::future::Future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 pub use url::Url;
 
@@ -163,17 +166,35 @@ pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
 ///
 /// A v4-mapped / v4-compatible form (`::ffff:a.b.c.d`, `::a.b.c.d`) is judged
 /// by its embedded v4 address, so a v4 range cannot be smuggled through a v6
-/// literal. Otherwise only global unicast (`2000::/3`) is accepted, minus the
-/// documentation prefix `2001:db8::/32` (globally shaped, not routable). That
-/// rules out loopback (`::1`), unspecified (`::`), unique-local (`fc00::/7`),
-/// link-local (`fe80::/10`), and multicast (`ff00::/8`) by construction.
+/// literal. Otherwise only global unicast (`2000::/3`) is accepted, minus three
+/// globally shaped prefixes that are not ordinary unicast destinations:
+///
+/// - `2001::/23`, the IETF protocol-assignment block: Teredo (`2001::/32`,
+///   which embeds an IPv4 address), benchmarking (`2001:2::/48`), ORCHID and
+///   the rest. Excluded whole rather than one range at a time.
+/// - `2001:db8::/32`, documentation.
+/// - `2002::/16`, 6to4, which embeds an IPv4 address (`2002:a9fe:a9fe::` is
+///   169.254.169.254) that a relay would unwrap.
+///
+/// Everything outside `2000::/3` is refused by construction: loopback (`::1`),
+/// unspecified (`::`), NAT64 (`64:ff9b::/96`), unique-local (`fc00::/7`),
+/// link-local (`fe80::/10`), and multicast (`ff00::/8`).
 pub fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     if let Some(v4) = ip.to_ipv4() {
         return is_public_ipv4(v4);
     }
-    let segments = ip.segments();
-    (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+    let [a, b, ..] = ip.segments();
+    let global_unicast = (a & 0xe000) == 0x2000;
+    let ietf_protocol_assignments = a == 0x2001 && b < 0x0200;
+    let documentation = a == 0x2001 && b == 0x0db8;
+    let six_to_four = a == 0x2002;
+    global_unicast && !ietf_protocol_assignments && !documentation && !six_to_four
 }
+
+/// How long [`resolve_pinned`] waits for DNS before refusing the destination,
+/// so a hostile or dead resolver for a requester-chosen hostname cannot stall
+/// the caller.
+pub const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A destination that PASSED the guard: the host plus the exact socket
 /// addresses it resolved to, every one of them checked public.
@@ -228,7 +249,8 @@ impl Destination {
 ///
 /// Every address must pass — not merely one — so a hostname answering with a
 /// mix of a public and an internal address is refused outright rather than
-/// racing on which one the connector picks.
+/// racing on which one the connector picks. Resolution is bounded by
+/// [`DNS_TIMEOUT`].
 pub async fn resolve_pinned(url: &Url) -> Result<Destination, GuardError> {
     check_url(url)?;
     let host = match url.host() {
@@ -252,10 +274,8 @@ pub async fn resolve_pinned(url: &Url) -> Result<Destination, GuardError> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| GuardError::new("URL must include a valid port"))?;
-    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .map_err(|e| GuardError::new(format!("DNS resolution failed: {e}")))?
-        .collect();
+    let mut addrs =
+        lookup_within(tokio::net::lookup_host((host.as_str(), port)), DNS_TIMEOUT).await?;
     addrs.sort_unstable();
     addrs.dedup();
     if addrs.is_empty() {
@@ -265,6 +285,23 @@ pub async fn resolve_pinned(url: &Url) -> Result<Destination, GuardError> {
         ensure_public_ip(addr.ip())?;
     }
     Ok(Destination { host, addrs })
+}
+
+/// Await a DNS lookup, refusing it if it fails or takes longer than `timeout`.
+async fn lookup_within<I>(
+    lookup: impl Future<Output = io::Result<I>>,
+    timeout: Duration,
+) -> Result<Vec<SocketAddr>, GuardError>
+where
+    I: Iterator<Item = SocketAddr>,
+{
+    match tokio::time::timeout(timeout, lookup).await {
+        Err(_) => Err(GuardError::new(format!(
+            "DNS resolution timed out after {timeout:?}"
+        ))),
+        Ok(Err(e)) => Err(GuardError::new(format!("DNS resolution failed: {e}"))),
+        Ok(Ok(addrs)) => Ok(addrs.collect()),
+    }
 }
 
 #[cfg(test)]
@@ -343,11 +380,42 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
+            "::169.254.169.254",  // v4-compatible
+            "64:ff9b::a9fe:a9fe", // NAT64 of 169.254.169.254
+            "64:ff9b::808:808",   // NAT64 of a public v4: still refused
             "2001:db8::1",
         ] {
             assert!(
                 ensure_public_ip(v6(ip)).is_err(),
                 "{ip} must be refused as non-public"
+            );
+        }
+    }
+
+    /// Prefixes inside `2000::/3` that are not ordinary unicast destinations.
+    /// 6to4 and Teredo embed an IPv4 address, so accepting them would let a v4
+    /// range back in through a relay.
+    #[test]
+    fn rejects_6to4_and_the_ietf_protocol_assignment_block() {
+        for ip in [
+            "2002::1",
+            "2002:a9fe:a9fe::",       // 6to4 of 169.254.169.254
+            "2002:ffff:ffff:ffff::1", // top of 2002::/16
+            "2001::1",                // Teredo 2001::/32
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001:2::1",   // benchmarking 2001:2::/48
+            "2001:10::1",  // ORCHID
+            "2001:1ff::1", // top of 2001::/23
+        ] {
+            assert!(
+                ensure_public_ip(v6(ip)).is_err(),
+                "{ip} must be refused as non-public"
+            );
+        }
+        for ip in ["2001:200::1", "2003::1", "2001:4860:4860::8888"] {
+            assert!(
+                ensure_public_ip(v6(ip)).is_ok(),
+                "{ip} is just outside and must be accepted"
             );
         }
     }
@@ -384,6 +452,10 @@ mod tests {
             "https://10.0.0.5/x",
             "https://0x7f.0.0.1/x",
             "https://203.0.113.7/x",
+            "https://[::169.254.169.254]/x",
+            "https://[64:ff9b::a9fe:a9fe]/x",
+            "https://[2002:a9fe:a9fe::]/x",
+            "https://[2001::a9fe:a9fe]/x",
         ] {
             let err = validate_url(raw).expect_err("an internal literal host must be refused");
             assert!(
@@ -440,6 +512,17 @@ mod tests {
             0,
             "the guard must refuse BEFORE connecting — the listener saw nothing"
         );
+    }
+
+    /// A resolver that never answers is refused once the timeout passes, rather
+    /// than stalling the caller.
+    #[tokio::test]
+    async fn a_lookup_that_never_answers_times_out() {
+        let never = std::future::pending::<io::Result<std::vec::IntoIter<SocketAddr>>>();
+        let err = lookup_within(never, Duration::from_millis(20))
+            .await
+            .expect_err("a hung lookup must be refused");
+        assert!(err.to_string().contains("timed out"), "got: {err}");
     }
 
     /// The pinned builder actually produces a usable client, and the pin is

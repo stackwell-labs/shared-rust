@@ -3,7 +3,9 @@ name = "platform-outbound-guard"
 # Explicit version (not inherited) so this crate can advance independently of
 # platform-lambda / platform-http-error (which stay at the workspace's 0.1.0).
 # 0.1.0 is the initial extraction of chirp-auth's webhook SSRF guard.
-version = "0.1.0"
+# 0.2.0 refuses 6to4 (2002::/16) and 2001::/23 (Teredo included), and bounds
+# resolve_pinned's DNS lookup by DNS_TIMEOUT.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +13,7 @@ description = "The canonical outbound-fetch (SSRF / DNS-rebinding) guard: a publ
 
 [dependencies]
 reqwest = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 url = "2"
 
 [dev-dependencies]

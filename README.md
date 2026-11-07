@@ -47,8 +47,11 @@ requester-supplied URLs. Two decisions: a public-address **allowlist**
 reserved range fails closed; and **resolve-then-pin** (`resolve_pinned` ->
 `Destination::client_builder`), which re-resolves the host immediately before
 each attempt, checks every returned address, and pins the client to exactly
-those socket addresses. A create-time URL check alone is not a guarantee — a
-hostname that passed it can later resolve to 169.254.169.254. Extracted from
+those socket addresses, with DNS bounded by `DNS_TIMEOUT`. IPv6 is held to
+`2000::/3` minus 6to4 (`2002::/16`), the IETF block `2001::/23` (Teredo
+included) and documentation; v4-mapped/compatible forms are judged by their v4
+address, and NAT64 is refused. A create-time URL check alone is not a
+guarantee — a hostname that passed it can later resolve to 169.254.169.254. Extracted from
 chirp-auth's `messaging.rs`; granite previously carried a create-time-only
 denylist with no resolution at all.
 
