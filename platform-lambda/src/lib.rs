@@ -43,11 +43,25 @@ pub use health::health_router;
 /// process distinguishes "running inside Lambda" from "running locally".
 const AWS_LAMBDA_RUNTIME_API_ENV: &str = "AWS_LAMBDA_RUNTIME_API";
 
+/// Start of the line [`serve`] prints on stdout once its local listener is
+/// bound: `listening on <addr>`, where `<addr>` is the address actually bound
+/// (`127.0.0.1:54321`, not the configured `127.0.0.1:0`), parseable as a
+/// [`SocketAddr`].
+///
+/// This line is a stable interface for a parent process that starts a service
+/// on port 0 and needs its port (compute-gateway#28): plain text, no ANSI
+/// codes, printed once, unaffected by the tracing filter or format. Other
+/// stdout lines (the tracing log) may come before or after it, so a reader
+/// should take the first line that starts with this prefix.
+pub const LISTENING_PREFIX: &str = "listening on ";
+
 /// Configuration for [`serve`]. Each field is the per-service value that used
 /// to be a hard-coded literal in every backend's `main`.
 #[derive(Debug, Clone, Copy)]
 pub struct ServeConfig {
     /// Env var holding the local bind address (e.g. `DRIVE_SERVICE_BIND_ADDR`).
+    /// Port 0 is accepted: the OS picks a free port, and [`serve`] reports the
+    /// one it got on stdout (see [`LISTENING_PREFIX`]).
     pub bind_env: &'static str,
     /// Default `host:port` used when `bind_env` is unset.
     pub default_bind: &'static str,
@@ -128,8 +142,12 @@ pub async fn shutdown_signal() {
 /// Initializes tracing (a no-op if the caller already did, with the same
 /// filter: see [`init_tracing`]), then:
 /// - if `AWS_LAMBDA_RUNTIME_API` is set, runs `app` under the Lambda runtime;
-/// - otherwise binds the configured address and serves locally with graceful
-///   shutdown on Ctrl-C / SIGTERM.
+/// - otherwise binds the configured address, prints
+///   `listening on <bound addr>` on stdout (see [`LISTENING_PREFIX`]; port 0
+///   is accepted and the line carries the port the OS picked), and serves
+///   locally with graceful shutdown on Ctrl-C / SIGTERM. The line is printed
+///   only after the bind succeeds, so a connection made once it is read is
+///   accepted.
 ///
 /// This consolidates the `main` body that drive/pigeon/bowerbird each
 /// duplicated. Panics with a descriptive message on any unrecoverable startup
@@ -151,7 +169,11 @@ pub async fn serve(app: Router, config: ServeConfig) {
     let listener = TcpListener::bind(bind_addr)
         .await
         .expect("bind service listener");
-    tracing::info!(%bind_addr, "starting service");
+    let bound = listener.local_addr().expect("read bound service address");
+    // Stdout is line-buffered, so the line reaches a parent reading the pipe
+    // before the server starts.
+    println!("{LISTENING_PREFIX}{bound}");
+    tracing::info!(%bound, "starting service");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
