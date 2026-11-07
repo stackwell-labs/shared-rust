@@ -9,10 +9,12 @@
 //!   app's chirp MACHINE token (bearer) + the recipient's cap. Sender-blind at
 //!   Drive: the cap, not the caller's identity, is the authority, and it
 //!   authorizes only append into the one partition it names.
-//! - [`feed_op_bytes`] — encode a row as the base64 canonical bytes of a
-//!   `FeedPostV1` store-core CRDT op at a key, so the wire bytes match Drive's
-//!   feed-fold exactly (no hand-rolled format). The recipient folds the feed via
-//!   `GET /v1/store/deposits?key=`.
+//! - [`feed_op_bytes_by`] — encode a row as the base64 canonical bytes of a
+//!   `FeedPostV1` store-core CRDT op at a key, naming the op's author, so the
+//!   wire bytes match Drive's feed-fold exactly (no hand-rolled format). The
+//!   recipient folds the feed via `GET /v1/store/deposits?key=`.
+//!   [`feed_op_bytes`] is the same with an empty author, for keyspaces where
+//!   Drive does not check it.
 //!
 //! What stays in each app: its feed-key constants, its row types, and its own
 //! provenance (notary / attestation) — this crate is pure platform protocol, no
@@ -105,15 +107,34 @@ impl DriveClient {
     }
 }
 
-/// Encode `row` as the base64 canonical bytes of a `FeedPostV1` CRDT op at `key` —
-/// the body it is deposited as. The row rides as **plaintext** JSON (this path is
-/// for recipient-readable feeds, not E2E; the app's own notary/attestation
-/// provenance lives inside the row). Uses store-core so the bytes match Drive's
-/// feed-fold exactly.
+/// Encode `row` as the base64 canonical bytes of a `FeedPostV1` CRDT op at `key`,
+/// with an empty `author` label — the body it is deposited as. The row rides as
+/// **plaintext** JSON (this path is for recipient-readable feeds, not E2E; the
+/// app's own notary/attestation provenance lives inside the row). Uses
+/// store-core so the bytes match Drive's feed-fold exactly.
 ///
-/// The op's own `author` label is left empty: the authenticated author is the
-/// app's attestation inside the row, and Drive ignores the feed-op label.
+/// Only for keyspaces where Drive ignores the op's `author`: there the
+/// authenticated author is the app's attestation inside the row. Under a
+/// signed keyspace (Profile B, today `pigeon/`) Drive refuses an op whose
+/// `author` is not its signer's Chirp sub (drive#26), so use
+/// [`feed_op_bytes_by`] there.
 pub fn feed_op_bytes<T: Serialize>(key: &str, row: &T) -> Result<String, DepositError> {
+    feed_op_bytes_by(key, "", row)
+}
+
+/// [`feed_op_bytes`], with the op's `author` set to `author`.
+///
+/// Drive checks the author on signed (Profile B) keyspaces, today `pigeon/`
+/// (drive#26, Drive's `docs/signed-authorship.md`): `author` must be the
+/// signer's Chirp sub, a key registered for that sub must have signed the row,
+/// and the row must carry that signature. Otherwise Drive refuses the whole
+/// batch with 403. Elsewhere Drive ignores `author` and it is a self-declared
+/// label. This crate only writes the label; signing the row is the caller's.
+pub fn feed_op_bytes_by<T: Serialize>(
+    key: &str,
+    author: &str,
+    row: &T,
+) -> Result<String, DepositError> {
     use base64::Engine;
     use store_core::crdt::{CrdtKey, OpBody, Replica};
     use store_core::record::blake3::Blake3Hasher;
@@ -123,7 +144,7 @@ pub fn feed_op_bytes<T: Serialize>(key: &str, row: &T) -> Result<String, Deposit
     let mut replica = Replica::new(Blake3Hasher);
     replica.author(OpBody::FeedPostV1 {
         key: CrdtKey(key.to_owned()),
-        author: String::new(),
+        author: author.to_owned(),
         body: Value::Text(json),
     });
     let op = replica
@@ -139,7 +160,7 @@ mod tests {
     use super::*;
     use base64::Engine;
     use serde::Deserialize;
-    use store_core::crdt::{CrdtKey, Op, Replica};
+    use store_core::crdt::{CrdtKey, Op, OpBody, Replica};
     use store_core::record::blake3::Blake3Hasher;
     use store_core::value::Value;
 
@@ -155,7 +176,10 @@ mod tests {
     #[test]
     fn row_round_trips_through_a_feed_op() {
         let key = "app/feed";
-        let row = Row { id: "r-1".into(), text: "hello 🌿".into() };
+        let row = Row {
+            id: "r-1".into(),
+            text: "hello 🌿".into(),
+        };
         let op_b64 = feed_op_bytes(key, &row).expect("encode");
 
         let bytes = base64::engine::general_purpose::STANDARD
@@ -170,6 +194,52 @@ mod tests {
         };
         let back: Row = serde_json::from_str(body).unwrap();
         assert_eq!(back, row);
+    }
+
+    fn decode_feed_post(op_b64: &str) -> (String, String) {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(op_b64)
+            .unwrap();
+        let OpBody::FeedPostV1 {
+            author,
+            body: Value::Text(body),
+            ..
+        } = Op::decode(&bytes).unwrap().body
+        else {
+            panic!("expected a FeedPostV1 with a text body");
+        };
+        (author, body)
+    }
+
+    /// The author a caller names is the op's `author`, which Drive checks on
+    /// `pigeon/` (drive#26); the row still rides unchanged in the body.
+    #[test]
+    fn feed_op_bytes_by_sets_the_author() {
+        let row = Row {
+            id: "m-1".into(),
+            text: "signed".into(),
+        };
+        let (author, body) = decode_feed_post(
+            &feed_op_bytes_by("pigeon/thread/t-1", "pairwise-sub-1", &row).expect("encode"),
+        );
+        assert_eq!(author, "pairwise-sub-1");
+        assert_eq!(serde_json::from_str::<Row>(&body).unwrap(), row);
+    }
+
+    /// `feed_op_bytes` is `feed_op_bytes_by` with an empty author, byte for byte,
+    /// so Porch's and gotta's deposits are unchanged.
+    #[test]
+    fn feed_op_bytes_is_the_empty_author() {
+        let row = Row {
+            id: "r-1".into(),
+            text: "hi".into(),
+        };
+        let unlabelled = feed_op_bytes("app/feed", &row).expect("encode");
+        assert_eq!(
+            unlabelled,
+            feed_op_bytes_by("app/feed", "", &row).expect("encode")
+        );
+        assert_eq!(decode_feed_post(&unlabelled).0, "");
     }
 
     /// base_url is normalized so a trailing slash never doubles in the deposit URL.
