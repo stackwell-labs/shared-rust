@@ -83,7 +83,14 @@ name = "platform-chirp-auth"
 # keys served by its `JwksServer`, so the `rsa`/`sha2`/`rand` deps and the
 # per-process RSA keygen are gone. Same public API; the key is now a fixed
 # public test key rather than one generated per test binary.
-version = "0.8.1"
+# 0.9.0 (shared-rust#27, repo tag v0.12.0) gives `Caller::Human` the
+# `client_id` its token was verified for: the one accepted audience in its
+# `aud` (a token naming two accepted audiences is now a 401, since whose
+# pairwise sub it is can't be told). A service with several Chirp clients
+# takes the client from the caller instead of re-decoding the bearer.
+# BREAKING for a `Caller::Human { sub }` pattern or literal without `..`:
+# add `client_id` (or `..`).
+version = "0.9.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

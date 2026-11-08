@@ -49,8 +49,13 @@ fn on(plane: Plane, caller: Caller) -> Result<Authenticated, AuthFailure> {
 }
 
 fn human(sub: &str) -> Caller {
+    human_at(sub, RP)
+}
+
+fn human_at(sub: &str, client_id: &str) -> Caller {
     Caller::Human {
         sub: sub.to_owned(),
+        client_id: client_id.to_owned(),
     }
 }
 
@@ -125,6 +130,34 @@ async fn refusals_are_401_and_a_rejected_machine_is_its_own_verdict() {
         auth.verify(&stranger).await,
         Err(AuthFailure::RejectedMachine)
     );
+}
+
+/// shared-rust#27: a service with several Chirp clients learns which one a
+/// person's token was minted for. Chirp's pairwise `sub` is per (person,
+/// client), so the same `sub` at two clients is two people, on either plane.
+#[tokio::test]
+async fn a_person_carries_the_client_their_token_was_for() {
+    let fixture = Fixture::global();
+    let tenant = fixture.test_issuer("tenant1");
+    let auth = Authenticator::new(Policy {
+        issuer: fixture.issuer().to_owned(),
+        humans: Some(set(&[RP, "cs_test_rp2"])),
+        machines: Machines::None,
+        test_tenants: Some(set(&["tenant1"])),
+    })
+    .unwrap();
+
+    for (client, sub) in [(RP, "sub_alice"), ("cs_test_rp2", "sub_alice")] {
+        assert_eq!(
+            auth.verify(&mint_human_id_token(fixture.issuer(), client, sub))
+                .await,
+            on(Plane::Prod, human_at(sub, client))
+        );
+        assert_eq!(
+            auth.verify(&mint_test_id_token(&tenant, client, sub)).await,
+            on(test_plane("tenant1"), human_at(sub, client))
+        );
+    }
 }
 
 #[tokio::test]

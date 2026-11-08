@@ -329,6 +329,7 @@ async fn refusals_before_granite_is_asked() {
     let person = Authenticated {
         caller: Caller::Human {
             sub: "sub_alice".to_owned(),
+            client_id: "cs_test_rp".to_owned(),
         },
         plane: Plane::Prod,
     };

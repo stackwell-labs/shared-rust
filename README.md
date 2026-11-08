@@ -42,8 +42,11 @@ Shared chirp-auth request plumbing:
   serves. `authenticate(&headers)` returns `Authenticated { caller, plane }` or
   an `AuthFailure`. The `Plane` (`Prod | Test { tenant }`) comes from the keyset
   that verified the token and picks the service's store handle; `Caller`
-  (`Human | Machine`) carries no environment, so nothing below the handle sees
-  one (agent-platform--protocols#39). `planes()` lists every plane for boot. A
+  (`Human { sub, client_id } | Machine { sub, owner_sub, client_id }`) carries
+  no environment, so nothing below the handle sees one
+  (agent-platform--protocols#39). A person's `client_id` is the accepted
+  audience their token was minted for, since Chirp's pairwise `sub` is per
+  (person, client) (shared-rust#27). `planes()` lists every plane for boot. A
   ChirpAuth outage is a 503,
   never a 401, and a rejected machine token is never retried as a human.
   `Authenticated` is the axum extractor (state needs `Authenticator: FromRef<S>`). The `env`
