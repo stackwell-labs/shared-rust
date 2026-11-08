@@ -83,6 +83,10 @@ static INSTALLED_FILTER: OnceLock<String> = OnceLock::new();
 /// [`serve`], which calls it again) reach the log instead of being dropped for
 /// want of a subscriber (drive#59).
 ///
+/// Under Lambda (`AWS_LAMBDA_RUNTIME_API` set) the log is plain text, with no
+/// ANSI colour codes, so CloudWatch shows it readably and a filter pattern can
+/// match a field or level as written; locally it is coloured.
+///
 /// # Panics
 ///
 /// If a later call passes a different `default_filter` (it would silently not
@@ -92,7 +96,13 @@ pub fn init_tracing(default_filter: &str) {
     let installed = INSTALLED_FILTER.get_or_init(|| {
         let filter =
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+        // CloudWatch shows escape codes verbatim, so a Lambda logs plain text;
+        // a local terminal keeps colour (shared-rust#26).
+        let ansi = std::env::var_os(AWS_LAMBDA_RUNTIME_API_ENV).is_none();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(ansi)
+            .init();
         default_filter.to_owned()
     });
     assert_eq!(

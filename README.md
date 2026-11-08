@@ -18,7 +18,8 @@ The axum-on-Lambda runtime glue that drive/pigeon/bowerbird carried
 byte-identically: `run_lambda` (wraps a `Router` in `axum_aws_lambda::LambdaLayer`
 and runs it under the Lambda runtime), `shutdown_signal` (Ctrl-C + SIGTERM),
 `init_tracing(default_filter)` (idempotent, so a backend can install tracing as the
-first line of `main`), and a one-call `serve(app, ServeConfig{ … })`
+first line of `main`; under Lambda it logs plain text, no ANSI colour codes,
+for CloudWatch), and a one-call `serve(app, ServeConfig{ … })`
 that owns the local-vs-Lambda detect. Locally, `serve` prints
 `listening on <addr>` on stdout with the address it actually bound
 (`LISTENING_PREFIX`), so a parent process can start a service on port 0 and read
