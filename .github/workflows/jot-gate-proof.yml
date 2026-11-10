@@ -52,7 +52,7 @@ jobs:
           if os.environ['EXPECT_FAILURE'] == 'true':
               assert os.environ['CANDIDATE_RESULT'] == 'failure'
               assert os.environ['PUBLICATION_RESULT'] == 'skipped'
-              assert stages['fresh passkey sign-in through Jot PKCE'] == 'passed'
+              assert stages['fresh magic-link sign-in through Jot PKCE'] == 'passed'
               assert stages['Granite consent and Jot grant linking'] == 'passed'
               assert stages['create, edit, history, archive, export, and restore'] == 'failed'
               assert stages['pre-revoke session can read notes'] == 'failed'
