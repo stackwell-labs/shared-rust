@@ -3,7 +3,7 @@ name: Verify Jot after release
 on:
   workflow_call:
     secrets:
-      STACKWELL_CI_APP_PRIVATE_KEY:
+      JOT_DISPATCH_APP_PRIVATE_KEY:
         required: true
 
 permissions:
@@ -17,8 +17,10 @@ jobs:
       - uses: actions/create-github-app-token@v1
         id: token
         with:
-          app-id: ${{ vars.STACKWELL_CI_APP_ID }}
-          private-key: ${{ secrets.STACKWELL_CI_APP_PRIVATE_KEY }}
+          # The dispatch App is installed only on Jot. The all-repository CI
+          # App has read-only Contents permission and must not gain Actions write.
+          app-id: ${{ vars.JOT_DISPATCH_APP_ID }}
+          private-key: ${{ secrets.JOT_DISPATCH_APP_PRIVATE_KEY }}
           owner: stackwell-labs
           repositories: jot
       - name: Dispatch and require successful live acceptance

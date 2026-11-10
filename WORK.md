@@ -1,4 +1,15 @@
-# Jot release acceptance — 2026-09-08
+# Jot live dispatch permission — 2026-09-30
+
+The live check's current App token cannot dispatch Jot: the all-repository
+`stackwell-labs-ci` App has only Contents read and Metadata read. Prepare the
+shared workflow to use `JOT_DISPATCH_APP_ID` and
+`JOT_DISPATCH_APP_PRIVATE_KEY` from a separate App installed only on Jot with
+Actions read/write. Existing callers pin the old shared-workflow SHA and remain
+unchanged until each caller supplies the new variable and secret and updates its
+pin. GitHub App creation and installation approval must happen in GitHub's
+organization settings UI before this workflow is adopted.
+
+# Prior work — Jot release acceptance, 2026-09-08
 
 Add public reusable workflow entry points for the Jot acceptance harness. Both
 the chirpauth and stackwell-labs organizations need to call them; private
