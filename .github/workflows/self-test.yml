@@ -17,10 +17,27 @@ name: shared-rust self-test
 # breaks its consumers, it breaks here first, in the repo that owns it, instead
 # of in five service pipelines at once.
 on:
-  push:
-    branches: ['**']
-    paths-ignore: ['**/*.md', 'README.md']
+  # Only on PRs that change a dependency file (amber-ci launch-readiness R4,
+  # amber-ci#38). amber-ci runs this workflow's jobs on each push to amber-git
+  # (.amber/ci.toml, job for job), and its amber-ci/* check runs are what
+  # landing waits on, with one exception: shared-rust rust-test.yml's blocking
+  # `audit`, which runs only on a PR that changes a lockfile, manifest or
+  # .cargo/audit.toml. amber-ci's audit is nightly (2026-11-05) and it has no
+  # path-filtered trigger, so GitHub still runs on exactly those PRs; the paths
+  # are rust-test.yml's deps-changed list. Every other PR is amber-ci's alone:
+  # a second copy billed Actions minutes, and with the org's budget spent
+  # (corey#211) a GitHub check that cannot start blocked PRs amber-ci passed.
+  # Here the paths also take rust-test.yml itself, which this workflow dogfoods
+  # (above): GitHub Actions YAML is the one thing amber-ci cannot run.
+  # Kept: workflow_dispatch, to run it by hand.
   pull_request:
+    paths:
+      - '**/Cargo.lock'
+      - '**/Cargo.toml'
+      - '**/package-lock.json'
+      - '**/package.json'
+      - '**/.cargo/audit.toml'
+      - '.github/workflows/rust-test.yml'
   workflow_dispatch: {}
 
 concurrency:
