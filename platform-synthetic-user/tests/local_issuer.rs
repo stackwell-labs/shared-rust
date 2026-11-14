@@ -6,10 +6,13 @@
 //! local control API, which is what an operator does for a real app. The
 //! user's own steps use only the public flows.
 //!
-//! Ignored by default because it needs that binary:
+//! Ignored by default because it needs that binary. `../issuer` builds it at
+//! a pinned revision, and amber-ci's `synthetic-user` job runs these tests
+//! against it:
 //!
 //! ```sh
-//! CHIRP_AUTH_SERVICE_BIN=/path/to/chirp-service \
+//! cargo build --locked --manifest-path platform-synthetic-user/issuer/Cargo.toml
+//! CHIRP_AUTH_SERVICE_BIN=platform-synthetic-user/issuer/target/debug/chirp-service \
 //!   cargo test -p platform-synthetic-user --test local_issuer -- --ignored --nocapture
 //! ```
 

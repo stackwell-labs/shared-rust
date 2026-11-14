@@ -137,12 +137,13 @@ The rotation finds the passkey to remove on the hosted passkey list page
 page's links fails the rotation loudly, here and in CI.
 
 ```sh
-# in a chirpauth/server-dev checkout
-cargo build --bin chirp-service --features local-serve
-# here
-CHIRP_AUTH_SERVICE_BIN=/path/to/target/debug/chirp-service \
+# the issuer, at the chirp-auth-server revision issuer/Cargo.toml pins
+cargo build --locked --manifest-path platform-synthetic-user/issuer/Cargo.toml
+CHIRP_AUTH_SERVICE_BIN=platform-synthetic-user/issuer/target/debug/chirp-service \
   cargo test -p platform-synthetic-user -- --include-ignored --nocapture
 ```
 
-CI runs the same in `.github/workflows/synthetic-user.yml`, against a pinned
-chirp-auth revision.
+amber-ci runs the same in the `synthetic-user` job (`.amber/ci.toml`). To
+prove the synthetic user against a newer ChirpAuth, bump `rev` in
+`issuer/Cargo.toml` and run `cargo update -p chirp-service` there; a failure
+after a bump means ChirpAuth's hosted flow changed.

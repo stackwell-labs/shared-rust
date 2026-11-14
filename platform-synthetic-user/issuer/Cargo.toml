@@ -1,0 +1,28 @@
+# The ChirpAuth issuer the live tests (../tests/local_issuer.rs) run against:
+# chirp-service built with `local-serve` at a pinned chirp-auth-server
+# revision, as amber-ci's `synthetic-user` job builds it (shared-rust#33).
+#
+# A crate, not a clone: its Cargo.lock pins chirp-auth-server and every
+# private crate that pulls in, which is what amber-ci grants a job read access
+# from (amber-ci docs/design.md §5), and `cargo build` here is an ordinary
+# offline build.
+#
+# Its own workspace, so `cargo test --workspace` at the root never builds it.
+#
+# Bump `rev` deliberately, then `cargo update -p chirp-service` here. A
+# failure after a bump means ChirpAuth's hosted flow changed.
+[package]
+name = "synthetic-user-issuer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "chirp-service"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chirp-service = { git = "https://amber-git.stackwell.tech/chirp-auth-server.git", rev = "118dd7a20680b22c363807c4a98e27f08ac8f179", features = ["local-serve"] }
+
+[workspace]

@@ -10,8 +10,10 @@
 # change to the reusable workflow breaks here first). That is a property of
 # GitHub Actions YAML, so it stays on GitHub.
 #
-# Private git deps: store-core is the only private one, and the planner grants
-# every private dep Cargo.lock pins, so no job lists git_read.
+# Private git deps: the planner grants every job read access to the private
+# repos any Cargo.lock in the tree pins, so no job lists git_read. The root
+# lockfile pins store-core; platform-synthetic-user/issuer/Cargo.lock pins
+# chirp-auth-server (amber-git) and the private crates it pulls in.
 #
 # Hermetic reuse: every job runs `fetch` with the network, then `run` with
 # none. No source file include_str!s anything, so markdown and the workflow
@@ -86,6 +88,37 @@ cache = "rust-1.97.0"
 exclude = ["**/*.md", ".github/**"]
 
 [job.script-tests.env]
+CARGO_HOME = "/cache/cargo"
+CARGO_TARGET_DIR = "/cache/target"
+
+[job.synthetic-user]
+# platform-synthetic-user's live tests (tests/local_issuer.rs), #[ignore]d in
+# `test` because they need a real ChirpAuth: chirp-service with local-serve,
+# built by platform-synthetic-user/issuer at the chirp-auth-server revision it
+# pins, run as a hermetic local issuer on loopback (shared-rust#33). It
+# replaces GitHub's synthetic-user.yml, which pinned chirpauth/server-dev.
+# Not required at first, like script-tests. Reuse with inputs.include scopes
+# it to this crate: a commit that leaves the crate, the issuer pin and the
+# workspace manifests alone reuses the last pass instead of building ChirpAuth.
+image = "docker.io/library/rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073"
+fetch = [
+  "cargo fetch --locked",
+  "cargo fetch --locked --manifest-path platform-synthetic-user/issuer/Cargo.toml",
+]
+run = [
+  "cargo build --locked --offline --manifest-path platform-synthetic-user/issuer/Cargo.toml",
+  "CHIRP_AUTH_SERVICE_BIN=/cache/target/debug/chirp-service cargo test -p platform-synthetic-user --locked --offline --no-fail-fast -- --include-ignored",
+]
+required_for_main = false
+reuse = true
+timeout_minutes = 60   # two cold compiles: this workspace and chirp-auth-server
+cache = "rust-1.97.0"
+
+[job.synthetic-user.inputs]
+include = ["platform-synthetic-user/**", "Cargo.toml", "Cargo.lock"]
+exclude = ["**/*.md"]
+
+[job.synthetic-user.env]
 CARGO_HOME = "/cache/cargo"
 CARGO_TARGET_DIR = "/cache/target"
 

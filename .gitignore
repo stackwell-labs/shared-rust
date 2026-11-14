@@ -1,2 +1,4 @@
 /target
 **/*.rs.bk
+# the issuer crate is a workspace of its own
+/platform-synthetic-user/issuer/target
