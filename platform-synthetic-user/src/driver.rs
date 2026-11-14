@@ -4,7 +4,8 @@
 //! (`extended_signup_script`, `extended_signin_script` in chirp-auth's
 //! `pages.rs`), with the browser's WebAuthn call answered by
 //! [`crate::Credential`]. No control token, test outbox, or other bypass is
-//! used. Each sign-in starts with no cookies, as a fresh browser would.
+//! used. Each sign-in starts with no cookies, as a fresh browser would; the
+//! consented sign-in makes its own session first and signs it out after.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -193,6 +194,94 @@ pub struct SignIn {
     pub nonce: String,
     /// The full `/token` response.
     pub token_response: Value,
+}
+
+/// One `/authorize` request for a public client, with the secrets only its
+/// caller holds: the PKCE verifier, and the `state` and `nonce` to check.
+struct AuthorizeRequest {
+    url: Url,
+    verifier: String,
+    state: String,
+    nonce: String,
+}
+
+impl AuthorizeRequest {
+    fn new(issuer: &Issuer, client: &PublicClient) -> Result<Self, Error> {
+        let verifier = b64_encode(&random_bytes::<32>()?);
+        let state = b64_encode(&random_bytes::<16>()?);
+        let nonce = b64_encode(&random_bytes::<16>()?);
+        let mut url = issuer.url("/authorize");
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client.client_id)
+            .append_pair("redirect_uri", &client.redirect_uri)
+            .append_pair("scope", &client.scope)
+            .append_pair("state", &state)
+            .append_pair("nonce", &nonce)
+            .append_pair(
+                "code_challenge",
+                &b64_encode(&Sha256::digest(verifier.as_bytes())),
+            )
+            .append_pair("code_challenge_method", "S256");
+        Ok(Self {
+            url,
+            verifier,
+            state,
+            nonce,
+        })
+    }
+
+    /// Check the callback is this request's, and redeem its code.
+    async fn redeem(
+        self,
+        issuer: &Issuer,
+        client: &PublicClient,
+        callback: &Url,
+    ) -> Result<SignIn, Error> {
+        let step = "callback";
+        let mut bare = callback.clone();
+        bare.set_query(None);
+        if bare.as_str()
+            != Url::parse(&client.redirect_uri)
+                .map_err(|e| protocol(step, e.to_string()))?
+                .as_str()
+        {
+            return Err(protocol(
+                step,
+                "code was sent somewhere other than redirect_uri",
+            ));
+        }
+        let params: HashMap<_, _> = callback.query_pairs().into_owned().collect();
+        if params.get("state") != Some(&self.state) {
+            return Err(protocol(step, "state does not match"));
+        }
+        let code = params
+            .get("code")
+            .ok_or_else(|| protocol(step, "no code"))?;
+
+        let response = issuer
+            .http
+            .post(issuer.url("/token"))
+            .form(&[
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", &client.redirect_uri),
+                ("client_id", &client.client_id),
+                ("code_verifier", &self.verifier),
+            ])
+            .send()
+            .await?;
+        let token_response: Value = json_ok("token", response).await?;
+        let id_token = token_response["id_token"]
+            .as_str()
+            .ok_or_else(|| protocol("token", "no id_token"))?
+            .to_string();
+        Ok(SignIn {
+            id_token,
+            nonce: self.nonce,
+            token_response,
+        })
+    }
 }
 
 /// A real ChirpAuth account held by software, bound to one state store.
@@ -395,68 +484,31 @@ impl<S: StateStore> SyntheticUser<S> {
     /// request (S256, fresh `state` and `nonce`), complete it as this user,
     /// check the callback, and redeem the code at `/token`.
     pub async fn sign_in(&mut self, client: &PublicClient) -> Result<SignIn, Error> {
-        let verifier = b64_encode(&random_bytes::<32>()?);
-        let state = b64_encode(&random_bytes::<16>()?);
-        let nonce = b64_encode(&random_bytes::<16>()?);
-        let mut url = self.issuer.url("/authorize");
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &client.client_id)
-            .append_pair("redirect_uri", &client.redirect_uri)
-            .append_pair("scope", &client.scope)
-            .append_pair("state", &state)
-            .append_pair("nonce", &nonce)
-            .append_pair(
-                "code_challenge",
-                &b64_encode(&Sha256::digest(verifier.as_bytes())),
-            )
-            .append_pair("code_challenge_method", "S256");
+        let request = AuthorizeRequest::new(&self.issuer, client)?;
+        let callback = self.authorize(&request.url).await?;
+        request.redeem(&self.issuer, client, &callback).await
+    }
 
-        let callback = self.authorize(&url).await?;
-        let step = "callback";
-        let mut bare = callback.clone();
-        bare.set_query(None);
-        if bare.as_str()
-            != Url::parse(&client.redirect_uri)
-                .map_err(|e| protocol(step, e.to_string()))?
-                .as_str()
-        {
-            return Err(protocol(
-                step,
-                "code was sent somewhere other than redirect_uri",
-            ));
-        }
-        let params: HashMap<_, _> = callback.query_pairs().into_owned().collect();
-        if params.get("state") != Some(&state) {
-            return Err(protocol(step, "state does not match"));
-        }
-        let code = params
-            .get("code")
-            .ok_or_else(|| protocol(step, "no code"))?;
-
-        let response = self
-            .issuer
-            .http
-            .post(self.issuer.url("/token"))
-            .form(&[
-                ("grant_type", "authorization_code"),
-                ("code", code),
-                ("redirect_uri", &client.redirect_uri),
-                ("client_id", &client.client_id),
-                ("code_verifier", &verifier),
-            ])
-            .send()
-            .await?;
-        let token_response: Value = json_ok("token", response).await?;
-        let id_token = token_response["id_token"]
-            .as_str()
-            .ok_or_else(|| protocol("token", "no id_token"))?
-            .to_string();
-        Ok(SignIn {
-            id_token,
-            nonce,
-            token_response,
-        })
+    /// Sign in to a public PKCE client the way a returning person does: sign
+    /// in to ChirpAuth itself first, open the client's `/authorize` request in
+    /// that session, and click "Continue as" on the page it shows. Then the
+    /// code is redeemed as in [`Self::sign_in`], and the session signed out.
+    ///
+    /// This is the only way to a scope ChirpAuth grants only to an
+    /// already-signed-in browser after an explicit click: `chirp.control`,
+    /// which its CLI client asks for and its operator routes require. A fresh
+    /// browser asking for it is refused with `login_required`, because the
+    /// sign-in page mints a code with no consent step.
+    pub async fn sign_in_with_consent(&mut self, client: &PublicClient) -> Result<SignIn, Error> {
+        let request = AuthorizeRequest::new(&self.issuer, client)?;
+        let session = self.account_session(Key::Current).await?;
+        let callback = session.consent(&self.issuer, &request.url).await;
+        // Signed out whatever the outcome, so no live session outlasts the
+        // call; a failed consent is the error worth reporting.
+        let signed_out = session.sign_out(&self.issuer).await;
+        let callback = callback?;
+        signed_out?;
+        request.redeem(&self.issuer, client, &callback).await
     }
 
     /// Rotate this account's passkey in place: register a new software
@@ -660,6 +712,63 @@ struct AccountSession {
 }
 
 impl AccountSession {
+    /// Open `authorize_url` in this session and submit its "Continue as"
+    /// form. Returns the callback URL the code is sent to, checked as
+    /// [`SyntheticUser::authorize`] checks its own.
+    async fn consent(&self, issuer: &Issuer, authorize_url: &Url) -> Result<Url, Error> {
+        let step = "consent page";
+        let response = issuer
+            .http
+            .get(authorize_url.clone())
+            .header("cookie", &self.cookie)
+            .send()
+            .await?;
+        if response.status().is_redirection() {
+            let location = location(&response);
+            return Err(protocol(
+                step,
+                format!(
+                    "redirected instead of a consent page: {}",
+                    error_of(&location)
+                ),
+            ));
+        }
+        if response.status() != StatusCode::OK {
+            return Err(rejected(step, response).await);
+        }
+        let page = response.text().await?;
+        let form = ConsentForm::parse(&page)
+            .ok_or_else(|| protocol(step, "no \"Continue as\" form on the page"))?;
+
+        let step = "consent";
+        let response = issuer
+            .post(issuer.url("/authorize/continue"), Some(self))
+            .form(&[
+                ("continuation_id", form.continuation_id.as_str()),
+                ("csrf", form.csrf.as_str()),
+            ])
+            .send()
+            .await?;
+        // A loopback redirect_uri gets a plain redirect; any other gets an
+        // interstitial page, which this driver does not follow.
+        if !response.status().is_redirection() {
+            return Err(rejected(step, response).await);
+        }
+        let callback =
+            Url::parse(&location(&response)).map_err(|e| protocol(step, e.to_string()))?;
+        let params: HashMap<_, _> = callback.query_pairs().into_owned().collect();
+        if let Some(error) = params.get("error") {
+            return Err(protocol(
+                step,
+                format!("RP redirect carries error {error:?}"),
+            ));
+        }
+        if params.get("iss").map(String::as_str) != Some(issuer.as_str()) {
+            return Err(protocol(step, "redirect iss is not this issuer"));
+        }
+        Ok(callback)
+    }
+
     /// The issuer's ids of the account's passkeys, read off the passkey list
     /// page: the hosted page is the only listing a session can read, and its
     /// remove links are what a person follows to remove one.
@@ -743,6 +852,51 @@ fn passkey_ids(html: &str) -> Vec<String> {
     ids
 }
 
+/// A response's `Location` header, or empty.
+fn location(response: &Response) -> String {
+    response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The hidden fields of the "Continue as" form on ChirpAuth's returning-user
+/// page (`returning_page` in chirp-auth's `pages.rs`).
+#[derive(Debug, PartialEq, Eq)]
+struct ConsentForm {
+    continuation_id: String,
+    csrf: String,
+}
+
+impl ConsentForm {
+    /// The first form's fields. The page's other form ("Sign in as someone
+    /// else") repeats them with an `action` of `switch`, so the first form is
+    /// the one that continues.
+    fn parse(html: &str) -> Option<Self> {
+        Some(Self {
+            continuation_id: hidden_input(html, "continuation_id")?,
+            csrf: hidden_input(html, "csrf")?,
+        })
+    }
+}
+
+/// The value of the first `<input type="hidden" name="{name}" value="...">`,
+/// with the HTML escapes the page writes undone.
+fn hidden_input(html: &str, name: &str) -> Option<String> {
+    let marker = format!(r#"name="{name}" value=""#);
+    let start = html.find(&marker)? + marker.len();
+    let end = html[start..].find('"')?;
+    let value = html[start..start + end]
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    (!value.is_empty()).then_some(value)
+}
+
 /// `error` and `error_description` of an error redirect, for the message.
 fn error_of(location: &str) -> String {
     let Ok(url) = Url::parse(location) else {
@@ -768,5 +922,32 @@ mod tests {
             <form action="/account/passkeys/pk_2b/remove"></form>"#;
         assert_eq!(passkey_ids(page), vec!["pk_1a", "pk_2b"]);
         assert!(passkey_ids("<p>No passkeys yet</p>").is_empty());
+    }
+
+    #[test]
+    fn the_consent_form_is_the_first_forms_hidden_fields() {
+        let page = r#"<form class="inline" method="post" action="/authorize/continue">
+      <input type="hidden" name="continuation_id" value="cont_1a">
+      <input type="hidden" name="csrf" value="a&amp;b">
+      <button class="primary" type="submit"><span>Continue as x</span></button>
+    </form>
+    <form class="inline" method="post" action="/authorize/continue">
+      <input type="hidden" name="continuation_id" value="cont_1a">
+      <input type="hidden" name="csrf" value="a&amp;b">
+      <input type="hidden" name="action" value="switch">
+    </form>"#;
+        assert_eq!(
+            ConsentForm::parse(page),
+            Some(ConsentForm {
+                continuation_id: "cont_1a".into(),
+                csrf: "a&b".into(),
+            })
+        );
+        assert_eq!(ConsentForm::parse("<p>Sign in</p>"), None);
+        assert_eq!(
+            ConsentForm::parse(r#"name="continuation_id" value="" name="csrf" value="x""#),
+            None,
+            "an empty continuation id is no form"
+        );
     }
 }

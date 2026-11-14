@@ -54,6 +54,10 @@ sequenceDiagram
   a server-side RP's login redirect) and returns the RP callback URL.
 - `user.sign_in(&PublicClient)`: the whole public-client flow, returning the
   `id_token` and the `nonce` to check. Verify the token with the RP's verifier.
+- `user.sign_in_with_consent(&PublicClient)`: the same, as a returning
+  person: a ChirpAuth session first, then the client's `/authorize` in it and
+  the "Continue as" click, then sign-out. ChirpAuth grants `chirp.control`
+  (its CLI client's scope, which its operator routes require) only this way.
 - `user.rotate_passkey()`: a new key on the same account, the old one
   removed. The account must hold exactly one passkey. If it is cut short,
   `state().is_rotating()` is true and calling it again finishes it.

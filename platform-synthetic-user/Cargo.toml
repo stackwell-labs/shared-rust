@@ -4,7 +4,9 @@ name = "platform-synthetic-user"
 # 0.1.0: software passkey + plain-HTTP ChirpAuth enroll / sign-in driver,
 # proven against a local issuer only.
 # 0.2.0: rotate_passkey, in place on the same account.
-version = "0.2.0"
+# 0.3.0: sign_in_with_consent, through a session and the "Continue as" click
+# (the only way to ChirpAuth's chirp.control scope; shared-rust#32).
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

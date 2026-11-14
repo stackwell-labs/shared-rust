@@ -32,6 +32,10 @@ use serde_json::{json, Value};
 const LOCAL_CONTROL_TOKEN: &str = "local-control-token";
 const CLIENT_ID: &str = "cs_dev_synthetic_user_journey";
 const REDIRECT_URI: &str = "http://127.0.0.1:9/callback";
+/// The client the local issuer binds `chirp.control` to, as live binds it to
+/// `cs_live_chirpcli`, with chirp-operator's loopback redirect.
+const CLI_CLIENT_ID: &str = "cs_dev_synthetic_user_cli";
+const CLI_REDIRECT_URI: &str = "http://127.0.0.1:3999/auth/callback";
 
 struct LocalIssuer {
     child: Child,
@@ -60,6 +64,7 @@ async fn start_issuer() -> LocalIssuer {
         .env("CHIRP_AUTH_LOCAL_ADDR", &addr)
         // Hermetic: ignore any operator CLI config in $HOME.
         .env("CHIRP_AUTH_CLI_CONFIG", "/nonexistent/chirp-auth-cli.toml")
+        .env("CHIRP_AUTH_CLI_CLIENT_ID", CLI_CLIENT_ID)
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
@@ -89,13 +94,17 @@ async fn start_issuer() -> LocalIssuer {
 
 /// Register the relying party, as an operator would for a real app.
 async fn register_public_client(issuer: &str) {
+    register(issuer, "Synthetic user journey", CLIENT_ID, REDIRECT_URI).await
+}
+
+async fn register(issuer: &str, name: &str, client_id: &str, redirect_uri: &str) {
     let response = reqwest::Client::new()
         .post(format!("{issuer}/control/apps"))
         .bearer_auth(LOCAL_CONTROL_TOKEN)
         .header("origin", issuer)
         .json(&json!({
-            "name": "Synthetic user journey", "issuer": issuer, "client_id": CLIENT_ID,
-            "environment": "dev", "redirect_uris": [REDIRECT_URI],
+            "name": name, "issuer": issuer, "client_id": client_id,
+            "environment": "dev", "redirect_uris": [redirect_uri],
             "type": "public", "access": "public",
         }))
         .send()
@@ -241,6 +250,87 @@ async fn synthetic_user_enrolls_signs_in_and_cannot_replay_a_counter() {
     let third = verified_sub(&issuer, &user.sign_in(&client()).await.expect("sign-in 3")).await;
     assert_eq!(first, third);
     eprintln!("sign-in 3 with the genuine state: same sub, counter 3");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn claims(jwt: &str) -> Value {
+    serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(jwt.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// `chirp.control` is granted only to a signed-in browser that then clicks
+/// "Continue as": a fresh-browser sign-in is refused, and the consented one
+/// returns a control access token ChirpAuth's control plane accepts.
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn a_consented_sign_in_holds_a_control_token() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    register(&issuer, "Chirp CLI", CLI_CLIENT_ID, CLI_REDIRECT_URI).await;
+    let dir = scratch_dir("consent");
+    let live = dir.join("user.json");
+    enroll(&issuer, &live).await;
+    let cli = PublicClient {
+        client_id: CLI_CLIENT_ID.into(),
+        redirect_uri: CLI_REDIRECT_URI.into(),
+        scope: "openid chirp.control".into(),
+    };
+
+    // A fresh browser is refused: the sign-in page has no consent step.
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    match user.sign_in(&cli).await {
+        Err(Error::Protocol {
+            step: "authorize",
+            detail,
+        }) => {
+            assert!(detail.contains("login_required"), "{detail}")
+        }
+        other => panic!("chirp.control without a session must be refused, got {other:?}"),
+    }
+
+    // Through a session and the click: a code, and a control access token.
+    let signed_in = user
+        .sign_in_with_consent(&cli)
+        .await
+        .expect("consented sign-in");
+    let id = claims(&signed_in.id_token);
+    assert_eq!(id["aud"], CLI_CLIENT_ID);
+    assert_eq!(id["nonce"], signed_in.nonce.as_str());
+    let access = signed_in.token_response["access_token"]
+        .as_str()
+        .expect("a chirp.control sign-in returns an access token");
+    let control = claims(access);
+    assert_eq!(control["aud"], "chirp-control");
+    assert_eq!(control["sub"], id["sub"], "the same pairwise sub");
+    eprintln!("consented sign-in: control token for sub {}", id["sub"]);
+
+    // The control plane verifies it: the account is simply not a developer
+    // yet (403), where an unverifiable token is 401.
+    let me = |token: &str| {
+        reqwest::Client::new()
+            .get(format!("{issuer}/control/developers/me"))
+            .bearer_auth(token.to_string())
+            .send()
+    };
+    assert_eq!(
+        me(access).await.unwrap().status(),
+        403,
+        "verified, not a developer"
+    );
+    assert_eq!(
+        me(&signed_in.id_token).await.unwrap().status(),
+        401,
+        "an RP id_token is not a control token"
+    );
+
+    // Each call makes and signs out its own session, so it repeats.
+    let again = user.sign_in_with_consent(&cli).await.expect("again");
+    assert_eq!(claims(&again.id_token)["sub"], id["sub"]);
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
