@@ -10,8 +10,10 @@
 //! - [`SyntheticUser`]: the browserless driver for ChirpAuth's public flows:
 //!   [`SyntheticUser::enroll`] (passkey signup), [`SyntheticUser::authorize`]
 //!   (any `/authorize` URL → the RP callback with a code),
-//!   [`SyntheticUser::sign_in`] (a public PKCE client end to end), and
-//!   [`SyntheticUser::rotate_passkey`] (a new key on the same account).
+//!   [`SyntheticUser::sign_in`] (a public PKCE client end to end),
+//!   [`SyntheticUser::rotate_passkey`] (a new key on the same account), and
+//!   [`SyntheticUser::delete_account`] (the account erased, as its holder
+//!   would erase it).
 //!
 //! State lives in a [`StateStore`]. An assertion is released only after its
 //! counter is saved (see [`state`] for the rule).

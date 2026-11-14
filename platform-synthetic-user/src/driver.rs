@@ -21,7 +21,7 @@ use crate::authenticator::{
     b64_encode, random_bytes, CreationOptions, Credential, RequestOptions, WebOrigin,
 };
 use crate::error::protocol;
-use crate::state::{Account, Key, Rotation, StateStore, UserState};
+use crate::state::{Account, Deletion, Key, Rotation, StateStore, UserState};
 use crate::Error;
 
 /// The header ChirpAuth's `/authorize` login page carries its login id in;
@@ -32,6 +32,14 @@ const SESSION_COOKIE: &str = "chirp_auth_session";
 /// The path ChirpAuth's passkey list links each passkey's remove page under:
 /// `/account/passkeys/{passkey_id}/remove`.
 const PASSKEY_PATH: &str = "/account/passkeys/";
+/// ChirpAuth's account deletion page and form (`account_delete`,
+/// `account_delete_submit` in chirp-auth's `handlers/misc.rs`).
+const DELETE_PATH: &str = "/account/delete";
+/// What the deletion form asks the person to type.
+const DELETE_PHRASE: &str = "delete my account";
+/// The `<title>` of the page ChirpAuth answers a completed deletion with
+/// (`account_deleted_page`). A refused phrase answers 200 too, with the form.
+const DELETED_TITLE: &str = "<title>Account deleted</title>";
 /// The empty form a bodiless POST from a hosted page submits.
 const NO_FORM: &[(&str, &str)] = &[];
 const MAX_ERROR_BODY: usize = 300;
@@ -348,7 +356,8 @@ impl<S: StateStore> SyntheticUser<S> {
     }
 
     /// Load an enrolled user. Never creates one: an empty store, a pending
-    /// enrollment, or a state for another issuer is an error.
+    /// enrollment, a deleted account, or a state for another issuer is an
+    /// error.
     pub async fn load(issuer: Issuer, store: S) -> Result<Self, Error> {
         let state = store
             .load()
@@ -365,6 +374,12 @@ impl<S: StateStore> SyntheticUser<S> {
             .account()
             .cloned()
             .ok_or_else(|| Error::State("enrollment never completed".into()))?;
+        if state.is_deleted() {
+            return Err(Error::State(format!(
+                "account {} was deleted; the store is only a record of it",
+                account.account_id
+            )));
+        }
         Ok(Self {
             issuer,
             state,
@@ -390,6 +405,7 @@ impl<S: StateStore> SyntheticUser<S> {
     /// The passkey path mints the code itself; with no prior session there
     /// is no separate consent page.
     pub async fn authorize(&mut self, authorize_url: &Url) -> Result<Url, Error> {
+        self.ensure_live()?;
         let step = "authorize";
         if authorize_url.origin().ascii_serialization() != self.issuer.as_str()
             || authorize_url.path() != "/authorize"
@@ -500,6 +516,7 @@ impl<S: StateStore> SyntheticUser<S> {
     /// browser asking for it is refused with `login_required`, because the
     /// sign-in page mints a code with no consent step.
     pub async fn sign_in_with_consent(&mut self, client: &PublicClient) -> Result<SignIn, Error> {
+        self.ensure_live()?;
         let request = AuthorizeRequest::new(&self.issuer, client)?;
         let session = self.account_session(Key::Current).await?;
         let callback = session.consent(&self.issuer, &request.url).await;
@@ -529,6 +546,7 @@ impl<S: StateStore> SyntheticUser<S> {
     /// step (see [`UserState::is_rotating`]) is finished by calling this
     /// again, from the same store.
     pub async fn rotate_passkey(&mut self) -> Result<(), Error> {
+        self.ensure_live()?;
         let mut session = None;
         if self.state.rotation().is_none() {
             self.register_next().await?;
@@ -580,6 +598,104 @@ impl<S: StateStore> SyntheticUser<S> {
         self.state.finish_rotation()?;
         self.store.save(&self.state).await?;
         session.sign_out(&self.issuer).await
+    }
+
+    /// Delete this account at ChirpAuth, the way a person does on its hosted
+    /// page: an account sign-in with the current key and no app (fresh, so it
+    /// passes the page's recent-sign-in gate), `GET /account/delete?armed=1`
+    /// for the form's CSRF token, and `POST /account/delete` with the typed
+    /// phrase. It succeeds only on ChirpAuth's "account deleted" page.
+    ///
+    /// The session is saved before the request is sent (see [`crate::state`]),
+    /// because once ChirpAuth has recorded the deletion it makes no new
+    /// sessions and that session alone can finish it. A deletion cut short
+    /// (see [`UserState::is_deleting`]) is finished by calling this again from
+    /// the same store: it retries through the saved session, with no new
+    /// sign-in. Only if ChirpAuth no longer accepts that session for the
+    /// deletion (401, or 403 for a sign-in no longer recent) does it sign in
+    /// afresh. Afterwards the store is marked deleted: [`Self::load`] refuses
+    /// it, and so does every flow on this value.
+    ///
+    /// ChirpAuth refuses (409) an account that owns apps or has a paid plan.
+    pub async fn delete_account(&mut self) -> Result<(), Error> {
+        match self.state.deletion() {
+            Some(Deletion::Deleted) => return Ok(()),
+            Some(Deletion::Requested { session }) => {
+                let session = AccountSession {
+                    cookie: session.clone(),
+                };
+                match self.submit_deletion(&session).await {
+                    Err(Error::Rejected {
+                        status: 401 | 403, ..
+                    }) => {}
+                    done => return done,
+                }
+            }
+            None => {}
+        }
+        let session = self.account_session(Key::Current).await?;
+        self.state.request_deletion(session.cookie.clone())?;
+        self.store.save(&self.state).await?;
+        self.submit_deletion(&session).await
+    }
+
+    /// Read the deletion form in `session` and submit it.
+    async fn submit_deletion(&mut self, session: &AccountSession) -> Result<(), Error> {
+        let step = "delete page";
+        let mut url = self.issuer.url(DELETE_PATH);
+        url.query_pairs_mut().append_pair("armed", "1");
+        let response = self
+            .issuer
+            .http
+            .get(url)
+            .header("cookie", &session.cookie)
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err(rejected(step, response).await);
+        }
+        let csrf = hidden_input(&response.text().await?, "csrf")
+            .ok_or_else(|| protocol(step, "no deletion form on the page"))?;
+
+        let step = "account delete";
+        let response = self
+            .issuer
+            .post(self.issuer.url(DELETE_PATH), Some(session))
+            .form(&[("confirm", DELETE_PHRASE), ("csrf", csrf.as_str())])
+            .send()
+            .await?;
+        match response.status() {
+            StatusCode::OK => {}
+            StatusCode::CONFLICT => {
+                return Err(Error::Rejected {
+                    step,
+                    status: 409,
+                    body: "ChirpAuth refuses to delete an account that owns apps or has a \
+                           paid plan"
+                        .into(),
+                })
+            }
+            _ => return Err(rejected(step, response).await),
+        }
+        if !response.text().await?.contains(DELETED_TITLE) {
+            return Err(protocol(
+                step,
+                "the issuer answered without confirming the deletion",
+            ));
+        }
+        self.state.finish_deletion()?;
+        self.store.save(&self.state).await
+    }
+
+    /// Refuse any flow on an account whose deletion was requested.
+    fn ensure_live(&self) -> Result<(), Error> {
+        match self.state.deletion() {
+            None => Ok(()),
+            Some(Deletion::Requested { .. }) => Err(Error::State(
+                "account deletion was requested; call delete_account to finish it".into(),
+            )),
+            Some(Deletion::Deleted) => Err(Error::State("the account was deleted".into())),
+        }
     }
 
     /// Register a new key beside the current one, saving it first.

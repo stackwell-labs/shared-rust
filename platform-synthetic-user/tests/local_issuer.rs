@@ -499,3 +499,144 @@ async fn a_rotation_cut_short_at_any_save_resumes_from_the_store() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// Erasure end to end: a user who signed in to a client deletes the account
+/// through the hosted page. Afterwards the store is refused, the account no
+/// longer signs in, and the client has a deletion event for the user's `sub`
+/// in the issuer's outbox.
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn synthetic_user_deletes_its_account() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    register_public_client(&issuer).await;
+    let dir = scratch_dir("delete");
+    let live = dir.join("user.json");
+    let stale = dir.join("before.json");
+
+    enroll(&issuer, &live).await;
+    let sub = sub_of(&issuer, &live).await;
+    std::fs::copy(&live, &stale).unwrap();
+
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    user.delete_account().await.expect("delete");
+    let deleted = FileStore::new(&live).load().await.unwrap().unwrap();
+    assert!(deleted.is_deleted() && !deleted.is_deleting());
+    eprintln!("deleted {}", deleted.account().unwrap().account_id);
+
+    // The store, and this value, refuse every flow from now on.
+    assert!(
+        matches!(user.sign_in(&client()).await, Err(Error::State(_))),
+        "a deleted user refuses to sign in"
+    );
+    assert!(
+        matches!(
+            SyntheticUser::load(Issuer::new(&issuer).unwrap(), FileStore::new(&live)).await,
+            Err(Error::State(_))
+        ),
+        "a deleted store refuses to load"
+    );
+    user.delete_account()
+        .await
+        .expect("deleting again is a no-op");
+
+    // ChirpAuth refuses the account: a copy of the state from before the
+    // deletion, key and all, can no longer start a sign-in.
+    let mut ghost = load(&issuer, FileStore::new(&stale)).await;
+    match ghost.sign_in(&client()).await {
+        Err(Error::Rejected {
+            step: "passkey start",
+            status,
+            body,
+        }) => {
+            assert_eq!(status, 400, "{body}");
+            assert!(body.contains("passkey unavailable"), "{body}");
+        }
+        other => panic!("a deleted account must not sign in, got {other:?}"),
+    }
+    eprintln!("the deleted account no longer signs in");
+
+    // The client the user signed in to is told, under the user's sub there.
+    let events: Value = reqwest::Client::new()
+        .get(format!("{issuer}/control/apps/deletion-events"))
+        .query(&[("client_id", CLIENT_ID)])
+        .bearer_auth(LOCAL_CONTROL_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .expect("deletion events")
+        .json()
+        .await
+        .unwrap();
+    let events = events["events"].as_array().expect("an events list");
+    assert_eq!(events.len(), 1, "one event for one deletion: {events:?}");
+    assert_eq!(events[0]["client_id"], CLIENT_ID);
+    assert_eq!(events[0]["sub"], sub.as_str());
+    eprintln!("deletion event for {CLIENT_ID}: {}", events[0]);
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A deletion saves three times: the sign-in's counter, the session that
+/// will ask for the deletion, and the end. Cut short after the session is
+/// saved, it resumes through that session with no new sign-in (the counter
+/// does not move). A saved session ChirpAuth no longer knows is replaced by
+/// a fresh sign-in.
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn a_deletion_cut_short_resumes_from_the_store() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    let dir = scratch_dir("delete-resume");
+
+    // Crash after saving the session, before the deletion is sent.
+    let live = dir.join("user.json");
+    enroll(&issuer, &live).await;
+    let mut user = load(
+        &issuer,
+        CrashAfter {
+            inner: FileStore::new(&live),
+            saves_left: 2,
+        },
+    )
+    .await;
+    let crashed = user.delete_account().await;
+    assert!(matches!(crashed, Err(Error::Store(_))), "{crashed:?}");
+    drop(user);
+    let cut = FileStore::new(&live).load().await.unwrap().unwrap();
+    assert!(cut.is_deleting());
+    let counter = cut.credential().sign_count();
+
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    assert!(
+        matches!(user.sign_in(&client()).await, Err(Error::State(_))),
+        "no flow but deletion while one is pending"
+    );
+    user.delete_account().await.expect("resume the deletion");
+    let after = FileStore::new(&live).load().await.unwrap().unwrap();
+    assert!(after.is_deleted());
+    assert_eq!(
+        after.credential().sign_count(),
+        counter,
+        "resumed through the saved session, not a new sign-in"
+    );
+    eprintln!("resumed through the saved session");
+
+    // A saved session the issuer does not know: sign in afresh and finish.
+    let live = dir.join("other.json");
+    enroll(&issuer, &live).await;
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&live).unwrap()).unwrap();
+    state["deletion"] = json!({ "requested": { "session": "chirp_auth_session=gone" } });
+    std::fs::write(&live, serde_json::to_vec(&state).unwrap()).unwrap();
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    user.delete_account()
+        .await
+        .expect("delete after the saved session was refused");
+    let after = FileStore::new(&live).load().await.unwrap().unwrap();
+    assert!(after.is_deleted());
+    assert_eq!(after.credential().sign_count(), 1, "one fresh sign-in");
+    eprintln!("an unknown saved session was replaced by a fresh sign-in");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

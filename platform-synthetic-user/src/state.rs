@@ -12,6 +12,12 @@
 //! the issuer has accepted a sign-in from it. So at every point the store
 //! holds a key the account accepts, and a rotation cut short anywhere resumes
 //! from the store (see [`crate::SyntheticUser::rotate_passkey`]).
+//!
+//! **Deletion rule (write-ahead as well).** The session that asks ChirpAuth to
+//! delete the account is saved before the request is sent: once ChirpAuth has
+//! recorded the deletion, no new session can be made, and that session is the
+//! only way to finish it. Once the issuer confirms the deletion the state is
+//! marked deleted, and [`crate::SyntheticUser::load`] refuses it.
 
 use std::future::Future;
 use std::io::Write;
@@ -42,6 +48,24 @@ pub struct UserState {
     /// that is not rotating, so such a state reads as it always has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rotation: Option<Rotation>,
+    /// `Some` once account deletion has been requested. Absent otherwise, so
+    /// a live account's state reads as it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deletion: Option<Deletion>,
+}
+
+/// Account deletion, requested or done. `Debug` is not derived: `session`
+/// is a bearer secret.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub(crate) enum Deletion {
+    /// Saved before the deletion request is sent. `session` is the
+    /// `Cookie` header value of the session that sends it, which ChirpAuth
+    /// keeps (and accepts on `/account/delete` only) until the deletion
+    /// commits, so a deletion cut short resumes through it.
+    Requested { session: String },
+    /// ChirpAuth confirmed the account is deleted.
+    Deleted,
 }
 
 /// A passkey rotation part way through.
@@ -86,6 +110,13 @@ impl std::fmt::Debug for UserState {
             .field("account_id", &self.account.as_ref().map(|a| &a.account_id))
             .field("credential", &self.credential)
             .field("rotation", &self.rotation)
+            .field(
+                "deletion",
+                &self.deletion.as_ref().map(|d| match d {
+                    Deletion::Requested { .. } => "requested",
+                    Deletion::Deleted => "deleted",
+                }),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -98,6 +129,7 @@ impl UserState {
             account: None,
             credential,
             rotation: None,
+            deletion: None,
         }
     }
 
@@ -121,6 +153,43 @@ impl UserState {
     /// [`crate::SyntheticUser::rotate_passkey`] again finishes it.
     pub fn is_rotating(&self) -> bool {
         self.rotation.is_some()
+    }
+
+    /// Whether account deletion was requested and has not been confirmed.
+    /// Running [`crate::SyntheticUser::delete_account`] again finishes it.
+    pub fn is_deleting(&self) -> bool {
+        matches!(self.deletion, Some(Deletion::Requested { .. }))
+    }
+
+    /// Whether the issuer confirmed this account deleted. Such a state is
+    /// kept only as a record: [`crate::SyntheticUser::load`] refuses it.
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.deletion, Some(Deletion::Deleted))
+    }
+
+    pub(crate) fn deletion(&self) -> Option<&Deletion> {
+        self.deletion.as_ref()
+    }
+
+    /// Record the session that will ask for deletion. The caller saves this
+    /// state before sending the request.
+    pub(crate) fn request_deletion(&mut self, session: String) -> Result<(), Error> {
+        if self.is_deleted() {
+            return Err(Error::State("the account is already deleted".into()));
+        }
+        self.deletion = Some(Deletion::Requested { session });
+        Ok(())
+    }
+
+    /// The issuer confirmed the deletion.
+    pub(crate) fn finish_deletion(&mut self) -> Result<(), Error> {
+        match self.deletion {
+            Some(Deletion::Requested { .. }) => {
+                self.deletion = Some(Deletion::Deleted);
+                Ok(())
+            }
+            _ => Err(Error::State("no requested deletion to finish".into())),
+        }
     }
 
     pub(crate) fn rotation(&self) -> Option<&Rotation> {
@@ -470,6 +539,43 @@ mod tests {
         assert!(!state.is_rotating());
         assert_eq!(state.credential().credential_id(), old_id);
         assert!(state.finish_rotation().is_err());
+    }
+
+    #[test]
+    fn a_deletion_is_requested_then_finished_and_never_undone() {
+        let (mut state, _) = enrolled();
+        assert!(state.finish_deletion().is_err(), "nothing requested yet");
+        state
+            .request_deletion("chirp_auth_session=SECRET-SESSION".into())
+            .unwrap();
+        assert!(state.is_deleting() && !state.is_deleted());
+        assert!(!format!("{state:?}").contains("SECRET-SESSION"));
+        // Mid-deletion the state reads back with its session.
+        let read = UserState::from_json(&state.to_json().unwrap()).unwrap();
+        assert!(matches!(
+            read.deletion(),
+            Some(Deletion::Requested { session }) if session.ends_with("SECRET-SESSION")
+        ));
+
+        state.finish_deletion().unwrap();
+        assert!(state.is_deleted() && !state.is_deleting());
+        let read = UserState::from_json(&state.to_json().unwrap()).unwrap();
+        assert!(read.is_deleted());
+        assert!(
+            !String::from_utf8(state.to_json().unwrap())
+                .unwrap()
+                .contains("SECRET-SESSION"),
+            "a deleted state keeps no session"
+        );
+        assert!(state.request_deletion("again".into()).is_err());
+        assert!(state.finish_deletion().is_err());
+
+        let (live, _) = enrolled();
+        let value: Value = serde_json::from_slice(&live.to_json().unwrap()).unwrap();
+        assert!(
+            value.get("deletion").is_none(),
+            "a live state has no deletion field"
+        );
     }
 
     #[test]
