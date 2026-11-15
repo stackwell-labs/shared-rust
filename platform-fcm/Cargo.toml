@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The one FCM HTTP v1 sender: service-account parsing, the RS256 OAuth mint and cache, a send that reports a typed Delivery, and a Message that makes every caller choose its Android priority."
+description = "The one FCM HTTP v1 sender: a service-account key (RS256 OAuth mint) or keyless Workload Identity Federation from an AWS role, a cached token, a send that reports a typed Delivery, and a Message that makes every caller choose its Android priority."
 
 [features]
 # The fake-FCM harness (`testkit`): a local OAuth token endpoint that verifies

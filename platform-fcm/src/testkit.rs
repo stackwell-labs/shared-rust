@@ -1,10 +1,16 @@
 //! A fake FCM for tests (`testkit` feature).
 //!
-//! One local HTTP server plays both of Google's endpoints the sender talks to:
+//! One local HTTP server plays every Google endpoint the sender talks to:
 //!
 //! - the OAuth token endpoint, which checks the RS256 JWT assertion against the
 //!   fake service account's public key (signature, `iss`, `aud`, `scope`,
 //!   expiry) before it issues a token, so the real mint path is exercised;
+//! - for the keyless credential ([`FakeFcm::external_account_sender`],
+//!   shared-rust#38), Google STS, which verifies the SigV4 signature on the
+//!   AWS `GetCallerIdentity` subject against the fake AWS role's secret (and
+//!   its date, host, session token and target pool) before it issues a
+//!   federated token, and the IAM credentials `generateAccessToken`, which
+//!   takes only a federated token it issued and grants the FCM scope;
 //! - the FCM v1 send endpoint, which requires a token it issued, records every
 //!   message, and answers per device: accepted by default, or whatever
 //!   [`FakeFcm::respond`] / [`FakeFcm::unregister`] set.
@@ -36,12 +42,42 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ring::signature::{KeyPair as _, RsaKeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
 
-use crate::{pkcs8_der_from_pem, HttpV1Sender, ServiceAccount, FCM_SCOPE};
+use crate::external_account::{sigv4, AwsCredentials};
+use crate::{
+    pkcs8_der_from_pem, Credential, ExternalAccount, HttpV1Sender, ServiceAccount,
+    AWS_SUBJECT_TOKEN_TYPE, FCM_SCOPE,
+};
 
 /// The fake service account's `client_email`.
 pub const CLIENT_EMAIL: &str = "fcm@fake-project.iam.gserviceaccount.com";
 /// The fake service account's `project_id`.
 pub const PROJECT_ID: &str = "fake-project";
+
+/// The workload identity pool provider the fake external account federates
+/// through.
+pub const AUDIENCE: &str =
+    "//iam.googleapis.com/projects/0/locations/global/workloadIdentityPools/fake-pool/providers/fake-aws";
+/// The fake AWS role credentials [`FakeFcm::external_account_sender`] signs
+/// with, as Lambda would put them in `AWS_ACCESS_KEY_ID`,
+/// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_REGION`.
+pub const AWS_ACCESS_KEY_ID: &str = "ASIAFAKEFAKEFAKEFAKE";
+pub const AWS_SECRET_ACCESS_KEY: &str = "fake/aws+secret/access/key";
+pub const AWS_SESSION_TOKEN: &str = "fake-aws-session-token";
+pub const AWS_REGION: &str = "eu-west-1";
+
+/// The `regional_cred_verification_url` of the fake external account. The
+/// fake STS checks the subject against it and never calls AWS.
+const VERIFICATION_URL: &str =
+    "https://sts.{region}.amazonaws.com?Action=GetCallerIdentity&Version=2011-06-15";
+
+fn fake_aws() -> AwsCredentials {
+    AwsCredentials {
+        access_key_id: AWS_ACCESS_KEY_ID.to_owned(),
+        secret_access_key: AWS_SECRET_ACCESS_KEY.to_owned(),
+        session_token: Some(AWS_SESSION_TOKEN.to_owned()),
+        region: AWS_REGION.to_owned(),
+    }
+}
 
 /// The fake service account's RSA-2048 private key, PKCS#8 PEM. A fixed,
 /// public test key (shared-rust#23), as chirp-auth-client's testkit keys are:
@@ -103,6 +139,7 @@ struct Inner {
     sent: Vec<Sent>,
     responses: HashMap<String, (u16, serde_json::Value)>,
     issued: Vec<String>,
+    federated: Vec<String>,
     token_lifetime_secs: u64,
     token_uri: String,
 }
@@ -130,6 +167,11 @@ impl FakeFcm {
         }));
         let app = Router::new()
             .route("/token", post(token))
+            .route("/sts/v1/token", post(sts))
+            .route(
+                &format!("/v1/projects/-/serviceAccounts/{CLIENT_EMAIL}:generateAccessToken"),
+                post(generate_access_token),
+            )
             .route("/v1/projects/{project}/messages:send", post(send))
             .with_state(inner.clone());
         tokio::spawn(async move {
@@ -155,7 +197,51 @@ impl FakeFcm {
     pub fn sender(&self) -> HttpV1Sender {
         let account = ServiceAccount::from_json(&self.service_account_json())
             .expect("the testkit service account parses");
-        HttpV1Sender::with_base(account, self.base.clone()).expect("build testkit sender")
+        HttpV1Sender::with_base(
+            Credential::ServiceAccount(account),
+            PROJECT_ID.to_owned(),
+            self.base.clone(),
+        )
+        .expect("build testkit sender")
+    }
+
+    /// An `external_account` config (AWS subject) whose STS and
+    /// impersonation endpoints are this fake, impersonating [`CLIENT_EMAIL`].
+    pub fn external_account_json(&self) -> String {
+        serde_json::json!({
+            "type": "external_account",
+            "audience": AUDIENCE,
+            "subject_token_type": AWS_SUBJECT_TOKEN_TYPE,
+            "service_account_impersonation_url": format!(
+                "{}/v1/projects/-/serviceAccounts/{CLIENT_EMAIL}:generateAccessToken",
+                self.base
+            ),
+            "token_url": format!("{}/sts/v1/token", self.base),
+            "credential_source": {
+                "environment_id": "aws1",
+                "region_url": "http://169.254.169.254/latest/meta-data/placement/availability-zone",
+                "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials",
+                "regional_cred_verification_url": VERIFICATION_URL,
+            },
+        })
+        .to_string()
+    }
+
+    /// A real keyless [`HttpV1Sender`]: it signs its AWS subject with the
+    /// fake role credentials ([`AWS_ACCESS_KEY_ID`] and the rest) and mints
+    /// through this fake's STS and `generateAccessToken`, then sends here to
+    /// [`PROJECT_ID`]. The same as `from_external_account_json(
+    /// &fcm.external_account_json(), PROJECT_ID)` with those variables set,
+    /// without touching the process environment.
+    pub fn external_account_sender(&self) -> HttpV1Sender {
+        self.external_account_sender_signing_as(fake_aws())
+    }
+
+    fn external_account_sender_signing_as(&self, aws: AwsCredentials) -> HttpV1Sender {
+        let account = ExternalAccount::from_json(&self.external_account_json())
+            .expect("the testkit external account parses");
+        HttpV1Sender::from_external_account(account, aws, PROJECT_ID, self.base.clone())
+            .expect("build testkit sender")
     }
 
     /// Answer every later send to `token` with `status` and `body` (FCM's
@@ -194,9 +280,15 @@ impl FakeFcm {
         self.lock().sent.clone()
     }
 
-    /// How many access tokens the token endpoint has issued.
+    /// How many FCM access tokens have been issued, by the token endpoint or
+    /// by `generateAccessToken`.
     pub fn tokens_issued(&self) -> usize {
         self.lock().issued.len()
+    }
+
+    /// How many AWS subjects STS has accepted and exchanged.
+    pub fn sts_exchanges(&self) -> usize {
+        self.lock().federated.len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -287,6 +379,179 @@ fn check_assertion(assertion: &str, token_uri: &str) -> Result<(), String> {
     }
 }
 
+/// Google STS: an RFC 8693 exchange of a signed AWS `GetCallerIdentity` for a
+/// federated token.
+async fn sts(State(inner): State<Shared>, Form(form): Form<HashMap<String, String>>) -> Answer {
+    let invalid = |why: &str| {
+        answer(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": "invalid_grant", "error_description": why }),
+        )
+    };
+    let wants = [
+        (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        ),
+        ("audience", AUDIENCE),
+        ("scope", "https://www.googleapis.com/auth/cloud-platform"),
+        (
+            "requested_token_type",
+            "urn:ietf:params:oauth:token-type:access_token",
+        ),
+        ("subject_token_type", AWS_SUBJECT_TOKEN_TYPE),
+    ];
+    for (name, want) in wants {
+        if form.get(name).map(String::as_str) != Some(want) {
+            return invalid(&format!("{name} is not {want}"));
+        }
+    }
+    let Some(subject) = form.get("subject_token") else {
+        return invalid("no subject_token");
+    };
+    if let Err(why) = check_subject(subject, now()) {
+        return invalid(&why);
+    }
+    let mut inner = inner.lock().expect("fake FCM state");
+    let issued = format!("fake-federated-token-{}", inner.federated.len() + 1);
+    inner.federated.push(issued.clone());
+    answer(
+        StatusCode::OK,
+        serde_json::json!({
+            "access_token": issued,
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        }),
+    )
+}
+
+/// Verify the subject the way Google STS does before it asks AWS: the
+/// request is a POST of `GetCallerIdentity` to the region's STS host, names
+/// the pool provider, carries the role's session token, is dated within AWS's
+/// 15 minutes, and its SigV4 signature verifies with the role's secret.
+fn check_subject(subject: &str, now: u64) -> Result<(), String> {
+    let subject = percent_decode(subject).ok_or("subject_token is not percent-encoded UTF-8")?;
+    let subject: serde_json::Value =
+        serde_json::from_str(&subject).map_err(|_| "subject_token is not JSON".to_owned())?;
+    let url = VERIFICATION_URL.replace("{region}", AWS_REGION);
+    if subject["url"] != url.as_str() || subject["method"] != "POST" {
+        return Err("subject is not a POST of GetCallerIdentity to the region's STS".into());
+    }
+    let headers: Vec<(String, String)> = subject["headers"]
+        .as_array()
+        .ok_or("subject has no headers")?
+        .iter()
+        .map(|h| {
+            (
+                h["key"].as_str().unwrap_or_default().to_owned(),
+                h["value"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    let expect = |name: &str, want: &str| match header(name) {
+        Some(v) if v == want => Ok(()),
+        other => Err(format!("{name} is {other:?}, want {want}")),
+    };
+    expect("x-goog-cloud-target-resource", AUDIENCE)?;
+    expect("host", &format!("sts.{AWS_REGION}.amazonaws.com"))?;
+    expect("x-amz-security-token", AWS_SESSION_TOKEN)?;
+    let amz_date = header("x-amz-date").ok_or("no x-amz-date")?;
+    // YYYYMMDDTHHMMSSZ sorts as it reads.
+    if amz_date < sigv4::amz_date(now - 900).as_str()
+        || amz_date > sigv4::amz_date(now + 900).as_str()
+    {
+        return Err(format!("x-amz-date {amz_date} is not within 15 minutes"));
+    }
+    let signed: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(k, _)| !k.eq_ignore_ascii_case("authorization"))
+        .cloned()
+        .collect();
+    let url = reqwest::Url::parse(&url).expect("the fake's verification URL parses");
+    let want = sigv4::authorization("POST", &url, &signed, "sts", &fake_aws(), amz_date);
+    if header("authorization") != Some(want.as_str()) {
+        return Err("signature does not verify".into());
+    }
+    Ok(())
+}
+
+/// IAM credentials `generateAccessToken` for [`CLIENT_EMAIL`]: takes a
+/// federated token STS issued and grants an FCM-scoped access token.
+async fn generate_access_token(
+    State(inner): State<Shared>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Answer {
+    let mut inner = inner.lock().expect("fake FCM state");
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if !bearer.is_some_and(|t| inner.federated.iter().any(|f| f == t)) {
+        return answer(
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({ "error": { "code": 401, "status": "UNAUTHENTICATED" } }),
+        );
+    }
+    let scoped = body["scope"]
+        .as_array()
+        .is_some_and(|s| s.iter().any(|v| v == FCM_SCOPE));
+    let lifetime = body["lifetime"]
+        .as_str()
+        .and_then(|l| l.strip_suffix('s'))
+        .and_then(|l| l.parse::<u64>().ok())
+        .filter(|l| (1..=43200).contains(l));
+    let (true, Some(lifetime)) = (scoped, lifetime) else {
+        return answer(
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({ "error": { "code": 400, "status": "INVALID_ARGUMENT",
+                "message": "scope must include firebase.messaging; lifetime is \"<1..43200>s\"" } }),
+        );
+    };
+    let issued = format!("fake-access-token-{}", inner.issued.len() + 1);
+    inner.issued.push(issued.clone());
+    let (y, mo, d, h, mi, s) = sigv4::civil(now() + lifetime);
+    answer(
+        StatusCode::OK,
+        serde_json::json!({
+            "accessToken": issued,
+            "expireTime": format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z"),
+        }),
+    )
+}
+
+/// Undo one layer of percent-encoding.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+}
+
 async fn send(
     State(inner): State<Shared>,
     Path(project): Path<String>,
@@ -370,5 +635,94 @@ mod tests {
             check_assertion(&tampered, uri),
             Err("signature does not verify".to_owned())
         );
+    }
+
+    /// The fake STS really checks the SigV4 signature, date and session
+    /// token: a subject signed with the wrong secret, dated too far back or
+    /// without the session token is refused, and nothing is minted.
+    #[tokio::test]
+    async fn the_fake_sts_refuses_a_subject_it_cannot_verify() {
+        let fcm = FakeFcm::start().await;
+        let account = ExternalAccount::from_json(&fcm.external_account_json()).unwrap();
+        let ok = account.subject_token(&fake_aws(), now()).unwrap();
+        assert_eq!(check_subject(&ok, now()), Ok(()));
+
+        let wrong_secret = AwsCredentials {
+            secret_access_key: "not-the-secret".into(),
+            ..fake_aws()
+        };
+        let subject = account.subject_token(&wrong_secret, now()).unwrap();
+        assert_eq!(
+            check_subject(&subject, now()),
+            Err("signature does not verify".to_owned())
+        );
+        let stale = account.subject_token(&fake_aws(), now() - 1000).unwrap();
+        assert!(check_subject(&stale, now())
+            .unwrap_err()
+            .contains("within 15 minutes"));
+        let no_session = AwsCredentials {
+            session_token: None,
+            ..fake_aws()
+        };
+        let subject = account.subject_token(&no_session, now()).unwrap();
+        assert!(check_subject(&subject, now())
+            .unwrap_err()
+            .starts_with("x-amz-security-token"));
+
+        // End to end: the sender's push fails with STS's reason.
+        let sender = fcm.external_account_sender_signing_as(wrong_secret);
+        let message = crate::Message {
+            priority: crate::Priority::Normal(None),
+            data: HashMap::new(),
+            ttl: std::time::Duration::from_secs(60),
+        };
+        match crate::FcmSender::send(&sender, "live-device", &message).await {
+            crate::Delivery::Failed { reason } => {
+                assert!(
+                    reason.starts_with("access-token mint failed: STS token exchange 400"),
+                    "{reason}"
+                );
+                assert!(reason.contains("signature does not verify"), "{reason}");
+            }
+            other => panic!("expected a mint failure, got {other:?}"),
+        }
+        assert_eq!((fcm.sts_exchanges(), fcm.tokens_issued()), (0, 0));
+        assert!(fcm.sent().is_empty());
+    }
+
+    /// A service account the federated identity may not impersonate (the
+    /// fake knows only its own) is refused by `generateAccessToken`, and the
+    /// push fails with that reason after STS accepted the subject.
+    #[tokio::test]
+    async fn an_impersonation_google_refuses_is_a_failure() {
+        let fcm = FakeFcm::start().await;
+        let mut config: serde_json::Value =
+            serde_json::from_str(&fcm.external_account_json()).unwrap();
+        let url = config["service_account_impersonation_url"]
+            .as_str()
+            .unwrap()
+            .replace(
+                CLIENT_EMAIL,
+                "someone-else@fake-project.iam.gserviceaccount.com",
+            );
+        config["service_account_impersonation_url"] = url.into();
+        let account = ExternalAccount::from_json(&config.to_string()).unwrap();
+        let sender =
+            HttpV1Sender::from_external_account(account, fake_aws(), PROJECT_ID, fcm.base.clone())
+                .unwrap();
+        let message = crate::Message {
+            priority: crate::Priority::Normal(None),
+            data: HashMap::new(),
+            ttl: std::time::Duration::from_secs(60),
+        };
+        match crate::FcmSender::send(&sender, "live-device", &message).await {
+            crate::Delivery::Failed { reason } => assert!(
+                reason.starts_with("access-token mint failed: generateAccessToken 404"),
+                "{reason}"
+            ),
+            other => panic!("expected a mint failure, got {other:?}"),
+        }
+        assert_eq!((fcm.sts_exchanges(), fcm.tokens_issued()), (1, 0));
+        assert!(fcm.sent().is_empty());
     }
 }

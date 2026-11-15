@@ -4,13 +4,17 @@
 //! the copies drifted: only Shriek's set Android priority and reported what
 //! became of a push. This crate is Shriek's version, made the only one.
 //!
-//! - [`ServiceAccount::from_json`] parses the Google service-account JSON and
-//!   loads its RSA key, so a credential that is set but bad fails at boot, not
+//! - Two credentials, one constructor each and no fallback between them:
+//!   [`HttpV1Sender::from_service_account_json`] (a Google service-account
+//!   key, signed into an RS256 JWT assertion) and
+//!   [`HttpV1Sender::from_external_account_json`] (keyless Workload Identity
+//!   Federation from the Lambda's AWS role, [`ExternalAccount`];
+//!   shared-rust#38). Either one that is set but unusable fails at boot, not
 //!   at the first push.
-//! - [`HttpV1Sender`] mints the OAuth token (an RS256 JWT assertion), caches
-//!   it, and sends. [`FcmSender::send`] returns a [`Delivery`] and never
-//!   panics or returns an error into the caller's write path: push is
-//!   best-effort, and the caller decides what a failure means.
+//! - [`HttpV1Sender`] mints the OAuth token, caches it, and sends.
+//!   [`FcmSender::send`] returns a [`Delivery`] and never panics or returns
+//!   an error into the caller's write path: push is best-effort, and the
+//!   caller decides what a failure means.
 //! - A [`Message`] must say its [`Priority`]. FCM's default when the `android`
 //!   block is absent is NORMAL, which a phone in Doze holds until its next
 //!   maintenance window (about 10 minutes; Shriek, 2026-10-25). A
@@ -23,8 +27,11 @@
 //! it chooses, and what it does with each [`Delivery`] (prune a device on
 //! [`Delivery::Unregistered`], count, audit).
 
+mod external_account;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+
+pub use external_account::{ExternalAccount, AWS_SUBJECT_TOKEN_TYPE};
 
 use std::collections::HashMap;
 use std::fmt;
@@ -231,7 +238,8 @@ pub trait FcmSender: Send + Sync {
 /// devices and no credential must show up as failed pushes, not as delivered.
 ///
 /// Not a fallback for a credential that is set but bad: that is a
-/// [`ServiceAccount::from_json`] error, and the service should refuse to boot.
+/// [`ConfigError`] from the sender's constructor, and the service should
+/// refuse to boot.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopSender;
 
@@ -239,19 +247,26 @@ pub struct NoopSender;
 impl FcmSender for NoopSender {
     async fn send(&self, _fcm_token: &str, _message: &Message) -> Delivery {
         Delivery::Failed {
-            reason: "push is not configured (no FCM service account)".to_owned(),
+            reason: "push is not configured (no FCM credential)".to_owned(),
         }
     }
 }
 
-/// A credential that cannot be used. The message names what is wrong and
-/// never carries the key or any other value from the JSON.
+/// A credential that cannot be used. The message names the credential and
+/// what is wrong with it, and never carries the key or any other value from
+/// the JSON or the environment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError(String);
 
+impl ConfigError {
+    fn service_account(message: impl fmt::Display) -> Self {
+        Self(format!("FCM service account: {message}"))
+    }
+}
+
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FCM service account: {}", self.0)
+        f.write_str(&self.0)
     }
 }
 
@@ -286,7 +301,7 @@ impl ServiceAccount {
         // Parsed to a Value first, and fields read by hand, so no serde
         // message can echo a field's value (the key) into the error.
         let value: serde_json::Value = serde_json::from_str(json).map_err(|e| {
-            ConfigError(format!(
+            ConfigError::service_account(format!(
                 "not JSON (line {}, column {})",
                 e.line(),
                 e.column()
@@ -295,7 +310,7 @@ impl ServiceAccount {
         let field = |name: &str| -> Result<String, ConfigError> {
             match value.get(name).and_then(|v| v.as_str()) {
                 Some(s) if !s.trim().is_empty() => Ok(s.to_owned()),
-                _ => Err(ConfigError(format!(
+                _ => Err(ConfigError::service_account(format!(
                     "`{name}` is missing, empty or not a string"
                 ))),
             }
@@ -308,8 +323,9 @@ impl ServiceAccount {
             Some(_) => field("token_uri")?,
         };
         let der = pkcs8_der_from_pem(&private_key)?;
-        let key = RsaKeyPair::from_pkcs8(&der)
-            .map_err(|e| ConfigError(format!("`private_key` is not a PKCS#8 RSA key: {e}")))?;
+        let key = RsaKeyPair::from_pkcs8(&der).map_err(|e| {
+            ConfigError::service_account(format!("`private_key` is not a PKCS#8 RSA key: {e}"))
+        })?;
         Ok(Self {
             client_email,
             token_uri,
@@ -355,84 +371,13 @@ impl ServiceAccount {
             .map_err(|e| format!("sign assertion: {e}"))?;
         Ok(format!("{signing_input}.{}", b64url(&sig)))
     }
-}
 
-/// Strip the PEM armour and base64-decode the body.
-fn pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, ConfigError> {
-    let b64: String = pem
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with("-----"))
-        .collect();
-    base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .map_err(|_| ConfigError("`private_key` is not base64 inside its PEM armour".to_owned()))
-}
-
-#[derive(Clone)]
-struct CachedToken {
-    token: String,
-    expires_at: u64,
-}
-
-/// The real sender: FCM HTTP v1 with a cached OAuth token.
-pub struct HttpV1Sender {
-    account: ServiceAccount,
-    /// [`FCM_BASE`]; the testkit points it at its fake.
-    fcm_base: String,
-    http: reqwest::Client,
-    token: Mutex<Option<CachedToken>>,
-}
-
-impl fmt::Debug for HttpV1Sender {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpV1Sender")
-            .field("account", &self.account)
-            .field("fcm_base", &self.fcm_base)
-            .finish_non_exhaustive()
-    }
-}
-
-impl HttpV1Sender {
-    pub fn new(account: ServiceAccount) -> Result<Self, ConfigError> {
-        Self::with_base(account, FCM_BASE.to_owned())
-    }
-
-    /// Parse `json` ([`ServiceAccount::from_json`]) and build the sender.
-    pub fn from_service_account_json(json: &str) -> Result<Self, ConfigError> {
-        Self::new(ServiceAccount::from_json(json)?)
-    }
-
-    fn with_base(account: ServiceAccount, fcm_base: String) -> Result<Self, ConfigError> {
-        let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| ConfigError(format!("build HTTP client: {e}")))?;
-        Ok(Self {
-            account,
-            fcm_base,
-            http,
-            token: Mutex::new(None),
-        })
-    }
-
-    pub fn account(&self) -> &ServiceAccount {
-        &self.account
-    }
-
-    /// A cached access token, or a freshly minted one.
-    async fn access_token(&self) -> Result<String, String> {
-        let now = now_unix();
-        let cached = self.token.lock().ok().and_then(|c| c.clone());
-        if let Some(cached) = cached {
-            if now + TOKEN_REFRESH_MARGIN_SECS < cached.expires_at {
-                return Ok(cached.token);
-            }
-        }
-        let assertion = self.account.assertion(now)?;
-        let resp = self
-            .http
-            .post(&self.account.token_uri)
+    /// Exchange a fresh assertion for an access token at `token_uri`.
+    /// Returns the token and how long it lives (seconds).
+    async fn mint(&self, http: &reqwest::Client, now: u64) -> Result<(String, u64), String> {
+        let assertion = self.assertion(now)?;
+        let resp = http
+            .post(&self.token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
                 ("assertion", assertion.as_str()),
@@ -457,6 +402,141 @@ impl HttpV1Sender {
             .get("expires_in")
             .and_then(|v| v.as_u64())
             .unwrap_or(3600);
+        Ok((token, ttl))
+    }
+}
+
+/// Strip the PEM armour and base64-decode the body.
+fn pkcs8_der_from_pem(pem: &str) -> Result<Vec<u8>, ConfigError> {
+    let b64: String = pem
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| {
+            ConfigError::service_account("`private_key` is not base64 inside its PEM armour")
+        })
+}
+
+#[derive(Clone)]
+struct CachedToken {
+    token: String,
+    expires_at: u64,
+}
+
+/// What a sender mints its OAuth token from.
+#[derive(Debug)]
+enum Credential {
+    ServiceAccount(ServiceAccount),
+    /// The config, and the AWS role credentials its subject is signed with.
+    ExternalAccount(ExternalAccount, external_account::AwsCredentials),
+}
+
+/// The real sender: FCM HTTP v1 with a cached OAuth token.
+pub struct HttpV1Sender {
+    credential: Credential,
+    /// The Firebase project sends go to.
+    project_id: String,
+    /// [`FCM_BASE`]; the testkit points it at its fake.
+    fcm_base: String,
+    http: reqwest::Client,
+    token: Mutex<Option<CachedToken>>,
+}
+
+impl fmt::Debug for HttpV1Sender {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpV1Sender")
+            .field("credential", &self.credential)
+            .field("project_id", &self.project_id)
+            .field("fcm_base", &self.fcm_base)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpV1Sender {
+    pub fn new(account: ServiceAccount) -> Result<Self, ConfigError> {
+        let project_id = account.project_id.clone();
+        Self::with_base(
+            Credential::ServiceAccount(account),
+            project_id,
+            FCM_BASE.to_owned(),
+        )
+    }
+
+    /// Parse `json` ([`ServiceAccount::from_json`]) and build the sender. It
+    /// sends to the key's own `project_id`.
+    pub fn from_service_account_json(json: &str) -> Result<Self, ConfigError> {
+        Self::new(ServiceAccount::from_json(json)?)
+    }
+
+    /// Parse `json` ([`ExternalAccount::from_json`]), read the AWS role
+    /// credentials and region from the environment Lambda sets
+    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+    /// `AWS_REGION`), and build a sender for the Firebase project
+    /// `project_id`. No key: the token is minted through Workload Identity
+    /// Federation. The config names no Firebase project, so the caller does.
+    pub fn from_external_account_json(json: &str, project_id: &str) -> Result<Self, ConfigError> {
+        let account = ExternalAccount::from_json(json)?;
+        let aws = external_account::AwsCredentials::from_env()?;
+        Self::from_external_account(account, aws, project_id, FCM_BASE.to_owned())
+    }
+
+    fn from_external_account(
+        account: ExternalAccount,
+        aws: external_account::AwsCredentials,
+        project_id: &str,
+        fcm_base: String,
+    ) -> Result<Self, ConfigError> {
+        if project_id.trim().is_empty() {
+            return Err(ConfigError(
+                "FCM external account: the Firebase project id is empty".to_owned(),
+            ));
+        }
+        Self::with_base(
+            Credential::ExternalAccount(account, aws),
+            project_id.to_owned(),
+            fcm_base,
+        )
+    }
+
+    fn with_base(
+        credential: Credential,
+        project_id: String,
+        fcm_base: String,
+    ) -> Result<Self, ConfigError> {
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .map_err(|e| ConfigError(format!("FCM sender: build HTTP client: {e}")))?;
+        Ok(Self {
+            credential,
+            project_id,
+            fcm_base,
+            http,
+            token: Mutex::new(None),
+        })
+    }
+
+    /// The Firebase project this sender sends to.
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// A cached access token, or a freshly minted one.
+    async fn access_token(&self) -> Result<String, String> {
+        let now = now_unix();
+        let cached = self.token.lock().ok().and_then(|c| c.clone());
+        if let Some(cached) = cached {
+            if now + TOKEN_REFRESH_MARGIN_SECS < cached.expires_at {
+                return Ok(cached.token);
+            }
+        }
+        let (token, ttl) = match &self.credential {
+            Credential::ServiceAccount(account) => account.mint(&self.http, now).await?,
+            Credential::ExternalAccount(account, aws) => account.mint(&self.http, aws, now).await?,
+        };
         if let Ok(mut cache) = self.token.lock() {
             *cache = Some(CachedToken {
                 token: token.clone(),
@@ -480,7 +560,7 @@ impl FcmSender for HttpV1Sender {
         };
         let url = format!(
             "{}/v1/projects/{}/messages:send",
-            self.fcm_base, self.account.project_id
+            self.fcm_base, self.project_id
         );
         let resp = match self
             .http
@@ -665,6 +745,25 @@ mod tests {
         };
         let json = std::fs::read_to_string(path).expect("read key file");
         let sender = HttpV1Sender::from_service_account_json(&json).expect("parse real key");
+        let token = sender.access_token().await.expect("mint an OAuth token");
+        assert!(!token.is_empty());
+    }
+
+    /// Verifies a REAL `external_account` config against this code path (the
+    /// SigV4 subject, Google STS and `generateAccessToken`). Runs only when
+    /// PLATFORM_FCM_EXTERNAL_ACCOUNT_FILE names the config, with AWS role
+    /// credentials the pool's provider trusts in `AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` and `AWS_REGION`; needs
+    /// the network. Sends nothing to any device.
+    #[tokio::test]
+    async fn a_real_external_account_mints_an_access_token() {
+        let Ok(path) = std::env::var("PLATFORM_FCM_EXTERNAL_ACCOUNT_FILE") else {
+            eprintln!("PLATFORM_FCM_EXTERNAL_ACCOUNT_FILE unset: skipping the real WIF token mint");
+            return;
+        };
+        let json = std::fs::read_to_string(path).expect("read config file");
+        let sender = HttpV1Sender::from_external_account_json(&json, "unused-by-the-mint")
+            .expect("parse the real config");
         let token = sender.access_token().await.expect("mint an OAuth token");
         assert!(!token.is_empty());
     }

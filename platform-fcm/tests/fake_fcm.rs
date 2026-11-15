@@ -113,3 +113,26 @@ async fn an_unreachable_token_endpoint_is_a_failure() {
         Delivery::Failed { .. }
     ));
 }
+
+/// The keyless credential (shared-rust#38): a signed AWS subject exchanged at
+/// STS, then an impersonated service account's FCM-scoped token, cached
+/// across sends like the key's.
+#[tokio::test]
+async fn an_external_account_mints_through_sts_and_impersonation() {
+    let fcm = FakeFcm::start().await;
+    fcm.unregister("dead-device");
+    let sender = fcm.external_account_sender();
+    assert_eq!(sender.project_id(), "fake-project");
+
+    let first = sender.send("live-device", &approval()).await;
+    assert!(matches!(first, Delivery::Accepted { .. }), "{first:?}");
+    assert!(matches!(
+        sender.send("dead-device", &approval()).await,
+        Delivery::Unregistered { .. }
+    ));
+    // One exchange and one impersonated token served both sends.
+    assert_eq!((fcm.sts_exchanges(), fcm.tokens_issued()), (1, 1));
+    let sent = fcm.sent();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body["android"]["priority"], "HIGH");
+}
