@@ -272,7 +272,9 @@ async fn request_link(issuer: &Issuer, login_id: &str, address: &str) -> Result<
 /// (`reference_id_from_trace` in chirp-auth's `lib.rs`): the first 12 bytes
 /// of its SHA-256, each a symbol of a 31-letter alphabet, as `XXXX-XXXX-XXXX`.
 /// A change there makes every sign-in here time out naming the reference
-/// it waited for, and the local test (against the pinned issuer) fails.
+/// it waited for. Only a live run catches that: the local issuer mails
+/// nothing, so its test's fake scrawl writes the mail with its own copy.
+/// chirp-auth#192 would put the reference on the waiting page instead.
 fn reference_id(trace_id: &str) -> String {
     const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
     let digest = Sha256::digest(trace_id.as_bytes());
