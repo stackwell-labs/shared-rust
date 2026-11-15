@@ -25,6 +25,27 @@ sequenceDiagram
     D->>C: POST /token (public client) → id_token
 ```
 
+A link sign-in holds no key and no state: the account is the one ChirpAuth
+has for a scrawl address the caller owns, and the mail is read with that
+address's mailbox token (agent-platform--protocols
+`docs/adr-synthetic-accounts-sign-in-by-link.md`):
+
+```mermaid
+sequenceDiagram
+    participant D as sign_in_by_link
+    participant C as ChirpAuth
+    participant S as scrawl (mailbox token)
+    D->>C: GET /authorize (PKCE S256, state, nonce) → login id
+    D->>S: GET /v1/messages (what is there before)
+    D->>C: POST /login/email (login_id, address) → waiting page's trace id
+    loop until the bound
+        D->>S: new mail whose Reference is this trace's
+    end
+    D->>C: POST /login/verify (the link's query) → callback, session
+    D->>C: POST /logout (that session)
+    D->>C: POST /token (public client) → id_token
+```
+
 Rotation replaces the key on the same account, so its id, its `sub` at each
 app and every grant keyed on it stay put:
 
@@ -91,6 +112,16 @@ sequenceDiagram
   store. If the deletion committed but its answer was lost, the saved session
   is gone with the account, so the retry's fresh sign-in is refused
   ("passkey unavailable"): ChirpAuth doesn't say which account ids exist.
+- `sign_in_by_link(&issuer, &PublicClient, &Mailbox)`: the public-client
+  flow by magic link, returning the `id_token` and `nonce` as `sign_in`
+  does. `Mailbox::new(scrawl_api, address, token)` takes the address's
+  `scrawl-admin issue` token; the address must be in ChirpAuth's
+  `bot_check_exempt_recipients`. The mail is the one after the request whose
+  `Reference` ChirpAuth derived from this sign-in's trace (the waiting page
+  shows the trace), so overlapping sign-ins to one address each follow their
+  own link. No such mail within `Mailbox::with_wait` (120 s by default) fails
+  naming the address and reference. A Zero (email) account only: ChirpAuth
+  refuses links for an Extended (passkey) one.
 - `StateStore` (`load`, `save`); `FileStore` writes atomically with mode 0600.
 
 ## Guarantees
@@ -135,6 +166,15 @@ a saved session ChirpAuth no longer knows is replaced by a fresh sign-in.
 ChirpAuth's local issuer has no fault injection, so a deletion that fails
 inside ChirpAuth part way is not exercised here; its resume is ChirpAuth's own
 (`docs/account-deletion.md`).
+
+The link sign-ins run against the same issuer, with a fake scrawl serving
+the links its test outbox captures (the local issuer mails nothing) as
+ChirpAuth's mail text. A second request's mail, newer than the driver's own,
+must not be followed; two sign-ins give one `sub` per app; no mail fails
+within the bound, naming the reference. The reference derivation is
+ChirpAuth's (`reference_id_from_trace`), copied here: a unit test pins two
+vectors computed apart from it, but only a live run proves it still matches
+ChirpAuth's real mail.
 
 The rotation finds the passkey to remove on the hosted passkey list page
 (its remove links), the only listing a session can read; a change to that

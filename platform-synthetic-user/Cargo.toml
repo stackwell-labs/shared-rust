@@ -8,11 +8,13 @@ name = "platform-synthetic-user"
 # (the only way to ChirpAuth's chirp.control scope; shared-rust#32).
 # 0.4.0: delete_account, through the hosted deletion page (shared-rust#30).
 # 0.5.0: open_session, a session on the account's own pages (chirp-auth#9).
-version = "0.5.0"
+# 0.6.0: sign_in_by_link, a magic-link sign-in read through a scrawl mailbox
+# token (shared-rust#36).
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "A synthetic ChirpAuth user: a software WebAuthn passkey with a durably persisted counter, and a browserless driver for ChirpAuth's real signup and PKCE sign-in flows."
+description = "A synthetic ChirpAuth user: a magic-link sign-in read through a scrawl mailbox, a software WebAuthn passkey with a durably persisted counter, and a browserless driver for ChirpAuth's real signup and PKCE sign-in flows."
 
 [dependencies]
 # ES256 is the only algorithm the authenticator offers. RustCrypto, pure Rust,
@@ -26,9 +28,13 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 url = "2"
 thiserror = "2"
+# The link sign-in polls its mailbox. Already in the tree through reqwest.
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
 # The integration test verifies issued ID tokens with the same verifier every
 # platform relying party uses, not with a hand-rolled check.
 chirp-auth-client = { workspace = true }
+# The fake scrawl the link sign-in test reads its mail from.
+axum = { workspace = true }

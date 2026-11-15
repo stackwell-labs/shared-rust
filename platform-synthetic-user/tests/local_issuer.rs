@@ -27,9 +27,11 @@ use chirp_auth_client::{
     verify_chirp_id_token, ChirpAuthConfig, ChirpVerifiedIdentity, VerifyOptions,
 };
 use platform_synthetic_user::{
-    Error, FileStore, Issuer, PublicClient, StateStore, SyntheticUser, UserState,
+    sign_in_by_link, Error, FileStore, Issuer, Mailbox, PublicClient, StateStore, SyntheticUser,
+    UserState,
 };
 use serde_json::{json, Value};
+use sha2::Digest;
 
 /// The fixed control token of chirp-auth's local issuer (`local_serve.rs`).
 const LOCAL_CONTROL_TOKEN: &str = "local-control-token";
@@ -131,7 +133,15 @@ fn client() -> PublicClient {
 
 /// Verify the ID token exactly as a platform RP does, then check its nonce.
 async fn verified_sub(issuer: &str, signed_in: &platform_synthetic_user::SignIn) -> String {
-    let config = ChirpAuthConfig::new(issuer, CLIENT_ID);
+    verified_sub_for(issuer, CLIENT_ID, signed_in).await
+}
+
+async fn verified_sub_for(
+    issuer: &str,
+    client_id: &str,
+    signed_in: &platform_synthetic_user::SignIn,
+) -> String {
+    let config = ChirpAuthConfig::new(issuer, client_id);
     let verified = verify_chirp_id_token(
         &reqwest::Client::new(),
         &config,
@@ -681,4 +691,313 @@ async fn an_open_session_reads_the_account_pages_until_signed_out() {
     assert_ne!(after.status(), 200, "a signed-out session reads nothing");
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A stand-in for scrawl's mailbox-token API (`GET /v1/messages`,
+/// `GET /v1/messages/:id`), fed from the local issuer's test outbox. The
+/// local issuer mails nothing, but captures the link of a sign-in to a UUID
+/// "address" under that UUID; the fake turns each new capture into the mail
+/// ChirpAuth would send (its text part's link and reference).
+mod fake_scrawl {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    pub const TOKEN: &str = "scrawl_mbx_fake";
+
+    struct Inner {
+        issuer: String,
+        key: String,
+        deliver: bool,
+        /// Traces already turned into mail (or never to be).
+        seen: HashSet<String>,
+        /// Another sign-in's captured link, delivered as the newest mail
+        /// right after the first real one.
+        decoy: Option<Value>,
+        /// (id, text), oldest first.
+        mail: Vec<(String, String)>,
+    }
+
+    #[derive(Clone)]
+    struct Fake(Arc<Mutex<Inner>>);
+
+    /// Serve the fake; returns its origin. `decoy`'s trace is never
+    /// delivered as itself, only as the decoy.
+    pub async fn start(issuer: &str, key: &str, deliver: bool, decoy: Option<Value>) -> String {
+        let seen = decoy
+            .iter()
+            .map(|link| link["trace_id"].as_str().unwrap().to_string())
+            .collect();
+        let fake = Fake(Arc::new(Mutex::new(Inner {
+            issuer: issuer.into(),
+            key: key.into(),
+            deliver,
+            seen,
+            decoy,
+            mail: Vec::new(),
+        })));
+        let app = Router::new()
+            .route("/v1/messages", get(list))
+            .route("/v1/messages/{id}", get(read))
+            .with_state(fake);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        origin
+    }
+
+    fn authorized(headers: &HeaderMap) -> bool {
+        headers.get("authorization").and_then(|v| v.to_str().ok())
+            == Some(&format!("Bearer {TOKEN}"))
+    }
+
+    /// ChirpAuth's `reference_id_from_trace`.
+    fn reference(trace: &str) -> String {
+        const ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+        let digest = Sha256::digest(trace.as_bytes());
+        let mut out = String::new();
+        for (i, &byte) in digest.iter().take(12).enumerate() {
+            if i == 4 || i == 8 {
+                out.push('-');
+            }
+            out.push(ALPHABET[usize::from(byte) % ALPHABET.len()] as char);
+        }
+        out
+    }
+
+    /// The text part of ChirpAuth's sign-in mail (`magic-link.txt`).
+    fn text(link: &Value) -> String {
+        format!(
+            "ChirpAuth — sign-in link\n\nSign in to Synthetic link app.\n\nContinue sign-in:\n{}\n\n\
+             This link expires in 15 minutes.\n\n---\nReference: {}\n---\n",
+            link["verify_url"].as_str().unwrap(),
+            reference(link["trace_id"].as_str().unwrap()),
+        )
+    }
+
+    async fn list(State(fake): State<Fake>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
+        if !authorized(&headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            );
+        }
+        let (issuer, key, deliver) = {
+            let inner = fake.0.lock().unwrap();
+            (inner.issuer.clone(), inner.key.clone(), inner.deliver)
+        };
+        let captured = if deliver {
+            super::captured_link(&issuer, &key).await
+        } else {
+            None
+        };
+        let mut inner = fake.0.lock().unwrap();
+        if let Some(link) = captured {
+            if inner
+                .seen
+                .insert(link["trace_id"].as_str().unwrap().to_string())
+            {
+                let id = format!("msg_{}", inner.mail.len());
+                inner.mail.push((id, text(&link)));
+                if let Some(decoy) = inner.decoy.take() {
+                    let id = format!("msg_{}", inner.mail.len());
+                    inner.mail.push((id, text(&decoy)));
+                }
+            }
+        }
+        let summaries: Vec<Value> = inner
+            .mail
+            .iter()
+            .rev()
+            .map(|(id, _)| json!({"id": id, "direction": "in", "subject": "Sign in to Synthetic link app — Chirp"}))
+            .collect();
+        (StatusCode::OK, Json(json!(summaries)))
+    }
+
+    async fn read(
+        State(fake): State<Fake>,
+        headers: HeaderMap,
+        Path(id): Path<String>,
+    ) -> (StatusCode, Json<Value>) {
+        if !authorized(&headers) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized"})),
+            );
+        }
+        let inner = fake.0.lock().unwrap();
+        match inner.mail.iter().find(|(known, _)| *known == id) {
+            Some((id, text)) => (StatusCode::OK, Json(json!({"id": id, "text": text}))),
+            None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))),
+        }
+    }
+}
+
+/// The link the local issuer captured for a sign-in to the UUID `key`.
+async fn captured_link(issuer: &str, key: &str) -> Option<Value> {
+    let response = reqwest::Client::new()
+        .get(format!("{issuer}/control/test-outbox"))
+        .query(&[("key", key)])
+        .bearer_auth(LOCAL_CONTROL_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    match response.status().as_u16() {
+        200 => Some(response.json().await.unwrap()),
+        404 => None,
+        status => panic!("test outbox: {status}"),
+    }
+}
+
+/// Start a sign-in by email to `address` for `client` the way the hosted
+/// page does, and return the link the local issuer captured for it: another
+/// request's mail, for the driver to tell apart from its own.
+async fn another_requests_link(issuer: &str, client: &PublicClient, address: &str) -> Value {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(b"another request's verifier"));
+    let page = http
+        .get(format!("{issuer}/authorize"))
+        .query(&[
+            ("response_type", "code"),
+            ("client_id", client.client_id.as_str()),
+            ("redirect_uri", client.redirect_uri.as_str()),
+            ("scope", "openid"),
+            ("state", "another-request"),
+            ("nonce", "another-request"),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+        ])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200, "login page");
+    let login_id = page.headers()["x-chirp-auth-login-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let sent = http
+        .post(format!("{issuer}/login/email"))
+        .header("origin", issuer)
+        .form(&[("login_id", login_id.as_str()), ("email", address)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status(), 200, "email sent");
+    captured_link(issuer, address).await.expect("link captured")
+}
+
+const LINK_CLIENT_ID: &str = "cs_dev_synthetic_user_link";
+/// Not loopback, so the link ends on ChirpAuth's "Signing you in" page
+/// rather than a plain redirect.
+const LINK_REDIRECT_URI: &str = "https://app.example/callback";
+
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn signs_in_by_link_following_its_own_mail() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    register_public_client(&issuer).await;
+    register(
+        &issuer,
+        "Synthetic link app",
+        LINK_CLIENT_ID,
+        LINK_REDIRECT_URI,
+    )
+    .await;
+    let link_client = PublicClient {
+        client_id: LINK_CLIENT_ID.into(),
+        redirect_uri: LINK_REDIRECT_URI.into(),
+        scope: "openid".into(),
+    };
+    // A UUID is the local issuer's test mailbox: its link is captured, not
+    // mailed. The fake scrawl serves it as mail.
+    let address = "6f1c2c1e-6c55-4c0e-9d64-3a0f6d0c1b2a";
+    // Another sign-in to the same address, whose mail arrives just after
+    // ours and so is the newest: following it would hand back that
+    // request's `state`, which the redeem refuses.
+    let decoy = another_requests_link(&issuer, &link_client, address).await;
+    let scrawl = fake_scrawl::start(&issuer, address, true, Some(decoy)).await;
+    let mailbox = Mailbox::new(&scrawl, address, fake_scrawl::TOKEN).unwrap();
+    let chirp = Issuer::new(&issuer).unwrap();
+
+    let first = sign_in_by_link(&chirp, &link_client, &mailbox)
+        .await
+        .expect("link sign-in past a newer mail of another request");
+    let sub = verified_sub_for(&issuer, LINK_CLIENT_ID, &first).await;
+    eprintln!("signed in by link through the interstitial: sub {sub}");
+
+    let again = sign_in_by_link(&chirp, &link_client, &mailbox)
+        .await
+        .expect("second link sign-in");
+    assert_eq!(
+        verified_sub_for(&issuer, LINK_CLIENT_ID, &again).await,
+        sub,
+        "the address is one account: same app, same sub"
+    );
+
+    let loopback = sign_in_by_link(&chirp, &client(), &mailbox)
+        .await
+        .expect("link sign-in to a loopback client (a plain redirect)");
+    let other = verified_sub(&issuer, &loopback).await;
+    assert_ne!(other, sub, "pairwise: another app, another sub");
+    eprintln!("signed in by link through a redirect: sub {other}");
+}
+
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn a_link_sign_in_with_no_mail_fails_naming_what_it_waited_for() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    register_public_client(&issuer).await;
+    let address = "0b0e9d36-1f86-4a8e-8f3c-2c7f5a1e9b44";
+    let scrawl = fake_scrawl::start(&issuer, address, false, None).await;
+    let chirp = Issuer::new(&issuer).unwrap();
+
+    let mailbox = Mailbox::new(&scrawl, address, fake_scrawl::TOKEN)
+        .unwrap()
+        .with_wait(Duration::from_secs(3));
+    let started = Instant::now();
+    let error = sign_in_by_link(&chirp, &client(), &mailbox)
+        .await
+        .expect_err("no mail arrives");
+    let message = error.to_string();
+    eprintln!("{message}");
+    assert!(
+        matches!(
+            error,
+            Error::Protocol {
+                step: "sign-in mail",
+                ..
+            }
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains(address) && message.contains("with reference"),
+        "names the address and the reference: {message}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10), "bounded");
+
+    let wrong = Mailbox::new(&scrawl, address, "scrawl_mbx_wrong").unwrap();
+    let refused = sign_in_by_link(&chirp, &client(), &wrong).await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Rejected {
+                step: "scrawl list",
+                status: 401,
+                ..
+            })
+        ),
+        "a bad mailbox token fails at once: {refused:?}"
+    );
 }

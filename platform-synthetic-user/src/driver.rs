@@ -41,7 +41,7 @@ const DELETE_PHRASE: &str = "delete my account";
 /// (`account_deleted_page`). A refused phrase answers 200 too, with the form.
 const DELETED_TITLE: &str = "<title>Account deleted</title>";
 /// The empty form a bodiless POST from a hosted page submits.
-const NO_FORM: &[(&str, &str)] = &[];
+pub(crate) const NO_FORM: &[(&str, &str)] = &[];
 const MAX_ERROR_BODY: usize = 300;
 
 /// A ChirpAuth issuer, addressed the way a browser reaches it.
@@ -49,7 +49,7 @@ const MAX_ERROR_BODY: usize = 300;
 pub struct Issuer {
     issuer: String,
     origin: WebOrigin,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
 }
 
 impl Issuer {
@@ -82,7 +82,7 @@ impl Issuer {
         &self.issuer
     }
 
-    fn url(&self, path: &str) -> Url {
+    pub(crate) fn url(&self, path: &str) -> Url {
         // Infallible: `issuer` parsed as a bare origin in `new`.
         Url::parse(&format!("{}{path}", self.issuer)).expect("issuer joins a path")
     }
@@ -90,7 +90,11 @@ impl Issuer {
     /// A POST as the hosted pages' scripts send it: from the issuer's own
     /// origin (which is also what passes ChirpAuth's CSRF gate for a
     /// cookie-bearing request), carrying the account session if there is one.
-    fn post(&self, url: Url, session: Option<&AccountSession>) -> reqwest::RequestBuilder {
+    pub(crate) fn post(
+        &self,
+        url: Url,
+        session: Option<&AccountSession>,
+    ) -> reqwest::RequestBuilder {
         let request = self.http.post(url).header("origin", self.issuer.as_str());
         match session {
             Some(session) => request.header("cookie", &session.cookie),
@@ -135,7 +139,10 @@ impl Issuer {
     }
 }
 
-async fn json_ok<T: DeserializeOwned>(step: &'static str, response: Response) -> Result<T, Error> {
+pub(crate) async fn json_ok<T: DeserializeOwned>(
+    step: &'static str,
+    response: Response,
+) -> Result<T, Error> {
     if response.status() != StatusCode::OK {
         return Err(rejected(step, response).await);
     }
@@ -143,7 +150,7 @@ async fn json_ok<T: DeserializeOwned>(step: &'static str, response: Response) ->
     serde_json::from_slice(&bytes).map_err(|e| protocol(step, format!("response body: {e}")))
 }
 
-async fn rejected(step: &'static str, response: Response) -> Error {
+pub(crate) async fn rejected(step: &'static str, response: Response) -> Error {
     let status = response.status().as_u16();
     let mut body = response.text().await.unwrap_or_default();
     if body.len() > MAX_ERROR_BODY {
@@ -206,15 +213,15 @@ pub struct SignIn {
 
 /// One `/authorize` request for a public client, with the secrets only its
 /// caller holds: the PKCE verifier, and the `state` and `nonce` to check.
-struct AuthorizeRequest {
-    url: Url,
+pub(crate) struct AuthorizeRequest {
+    pub(crate) url: Url,
     verifier: String,
     state: String,
     nonce: String,
 }
 
 impl AuthorizeRequest {
-    fn new(issuer: &Issuer, client: &PublicClient) -> Result<Self, Error> {
+    pub(crate) fn new(issuer: &Issuer, client: &PublicClient) -> Result<Self, Error> {
         let verifier = b64_encode(&random_bytes::<32>()?);
         let state = b64_encode(&random_bytes::<16>()?);
         let nonce = b64_encode(&random_bytes::<16>()?);
@@ -240,7 +247,7 @@ impl AuthorizeRequest {
     }
 
     /// Check the callback is this request's, and redeem its code.
-    async fn redeem(
+    pub(crate) async fn redeem(
         self,
         issuer: &Issuer,
         client: &PublicClient,
@@ -406,37 +413,7 @@ impl<S: StateStore> SyntheticUser<S> {
     /// is no separate consent page.
     pub async fn authorize(&mut self, authorize_url: &Url) -> Result<Url, Error> {
         self.ensure_live()?;
-        let step = "authorize";
-        if authorize_url.origin().ascii_serialization() != self.issuer.as_str()
-            || authorize_url.path() != "/authorize"
-        {
-            return Err(protocol(step, "not this issuer's /authorize endpoint"));
-        }
-        let response = self.issuer.http.get(authorize_url.clone()).send().await?;
-        match response.status() {
-            StatusCode::OK => {}
-            status if status.is_redirection() => {
-                // A fresh browser has no session, so a redirect here is an
-                // RFC 6749 error redirect (bad scope, PKCE, ...).
-                let location = response
-                    .headers()
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or_default();
-                return Err(protocol(
-                    step,
-                    format!("redirected instead of a login page: {}", error_of(location)),
-                ));
-            }
-            _ => return Err(rejected(step, response).await),
-        }
-        let login_id = response
-            .headers()
-            .get(LOGIN_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| protocol(step, "login page carried no login id"))?
-            .to_string();
-
+        let login_id = login_page(&self.issuer, authorize_url).await?;
         let ceremony: Ceremony<RequestOptions> = self
             .issuer
             .post_form(
@@ -474,26 +451,7 @@ impl<S: StateStore> SyntheticUser<S> {
                 format!("no redirect (status {:?})", finished.status),
             ));
         };
-        let redirect =
-            Url::parse(&redirect).map_err(|e| protocol("passkey finish", e.to_string()))?;
-        let params: HashMap<_, _> = redirect.query_pairs().into_owned().collect();
-        if let Some(error) = params.get("error") {
-            return Err(protocol(
-                "passkey finish",
-                format!("RP redirect carries error {error:?}"),
-            ));
-        }
-        // RFC 9207: the code must come from the issuer we meant to talk to.
-        if params.get("iss").map(String::as_str) != Some(self.issuer.as_str()) {
-            return Err(protocol(
-                "passkey finish",
-                "redirect iss is not this issuer",
-            ));
-        }
-        if !params.contains_key("code") {
-            return Err(protocol("passkey finish", "redirect carries no code"));
-        }
-        Ok(redirect)
+        callback_with_code("passkey finish", &self.issuer, &redirect)
     }
 
     /// Sign in to a public PKCE client end to end: build the `/authorize`
@@ -838,7 +796,7 @@ impl<S: StateStore> SyntheticUser<S> {
 /// bearer secret.
 pub struct AccountSession {
     /// `chirp_auth_session=<token>`, as a `Cookie` header carries it.
-    cookie: String,
+    pub(crate) cookie: String,
 }
 
 impl AccountSession {
@@ -890,19 +848,7 @@ impl AccountSession {
         if !response.status().is_redirection() {
             return Err(rejected(step, response).await);
         }
-        let callback =
-            Url::parse(&location(&response)).map_err(|e| protocol(step, e.to_string()))?;
-        let params: HashMap<_, _> = callback.query_pairs().into_owned().collect();
-        if let Some(error) = params.get("error") {
-            return Err(protocol(
-                step,
-                format!("RP redirect carries error {error:?}"),
-            ));
-        }
-        if params.get("iss").map(String::as_str) != Some(issuer.as_str()) {
-            return Err(protocol(step, "redirect iss is not this issuer"));
-        }
-        Ok(callback)
+        callback_with_code(step, issuer, &location(&response))
     }
 
     /// The issuer's ids of the account's passkeys, read off the passkey list
@@ -956,9 +902,67 @@ impl AccountSession {
     }
 }
 
+/// Open an `/authorize` URL as a fresh browser (no cookies) and return the
+/// login id of the sign-in page it shows.
+pub(crate) async fn login_page(issuer: &Issuer, authorize_url: &Url) -> Result<String, Error> {
+    let step = "authorize";
+    if authorize_url.origin().ascii_serialization() != issuer.as_str()
+        || authorize_url.path() != "/authorize"
+    {
+        return Err(protocol(step, "not this issuer's /authorize endpoint"));
+    }
+    let response = issuer.http.get(authorize_url.clone()).send().await?;
+    match response.status() {
+        StatusCode::OK => {}
+        // A fresh browser has no session, so a redirect here is an RFC 6749
+        // error redirect (bad scope, PKCE, ...).
+        status if status.is_redirection() => {
+            return Err(protocol(
+                step,
+                format!(
+                    "redirected instead of a login page: {}",
+                    error_of(&location(&response))
+                ),
+            ));
+        }
+        _ => return Err(rejected(step, response).await),
+    }
+    Ok(response
+        .headers()
+        .get(LOGIN_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| protocol(step, "login page carried no login id"))?
+        .to_string())
+}
+
+/// The RP callback ChirpAuth sent the browser to, checked: no `error`, an
+/// `iss` of this issuer (RFC 9207: the code must come from the issuer we
+/// meant to talk to), and a `code`.
+pub(crate) fn callback_with_code(
+    step: &'static str,
+    issuer: &Issuer,
+    callback: &str,
+) -> Result<Url, Error> {
+    let callback = Url::parse(callback).map_err(|e| protocol(step, e.to_string()))?;
+    let params: HashMap<_, _> = callback.query_pairs().into_owned().collect();
+    if let Some(error) = params.get("error") {
+        return Err(protocol(
+            step,
+            format!("RP redirect carries error {error:?}"),
+        ));
+    }
+    if params.get("iss").map(String::as_str) != Some(issuer.as_str()) {
+        return Err(protocol(step, "redirect iss is not this issuer"));
+    }
+    if !params.contains_key("code") {
+        return Err(protocol(step, "redirect carries no code"));
+    }
+    Ok(callback)
+}
+
 /// The `name=value` of ChirpAuth's session cookie, from a response's
 /// `Set-Cookie` headers.
-fn session_cookie(response: &Response) -> Option<String> {
+pub(crate) fn session_cookie(response: &Response) -> Option<String> {
     response
         .headers()
         .get_all("set-cookie")
@@ -989,7 +993,7 @@ fn passkey_ids(html: &str) -> Vec<String> {
 }
 
 /// A response's `Location` header, or empty.
-fn location(response: &Response) -> String {
+pub(crate) fn location(response: &Response) -> String {
     response
         .headers()
         .get("location")
@@ -1024,17 +1028,21 @@ fn hidden_input(html: &str, name: &str) -> Option<String> {
     let marker = format!(r#"name="{name}" value=""#);
     let start = html.find(&marker)? + marker.len();
     let end = html[start..].find('"')?;
-    let value = html[start..start + end]
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&");
+    let value = unescape_html(&html[start..start + end]);
     (!value.is_empty()).then_some(value)
 }
 
+/// Undo the HTML escapes ChirpAuth's pages write (`escape_html`).
+pub(crate) fn unescape_html(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 /// `error` and `error_description` of an error redirect, for the message.
-fn error_of(location: &str) -> String {
+pub(crate) fn error_of(location: &str) -> String {
     let Ok(url) = Url::parse(location) else {
         return "unparseable location".into();
     };

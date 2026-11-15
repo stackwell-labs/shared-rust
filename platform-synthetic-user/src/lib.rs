@@ -17,6 +17,12 @@
 //!   [`SyntheticUser::delete_account`] (the account erased, as its holder
 //!   would erase it).
 //!
+//! [`sign_in_by_link`] signs in by magic link instead, as launch users do:
+//! ChirpAuth mails a link to a scrawl address the caller owns, read back with
+//! that [`Mailbox`]'s token. It holds no key and writes no state; the passkey
+//! half goes once its callers move (agent-platform--protocols
+//! `docs/adr-synthetic-accounts-sign-in-by-link.md`).
+//!
 //! State lives in a [`StateStore`]. An assertion is released only after its
 //! counter is saved (see [`state`] for the rule).
 //!
@@ -39,9 +45,11 @@
 mod authenticator;
 mod driver;
 mod error;
+mod link;
 pub mod state;
 
 pub use authenticator::Credential;
 pub use driver::{AccountSession, Issuer, PublicClient, SignIn, SyntheticUser};
 pub use error::Error;
+pub use link::{sign_in_by_link, Mailbox};
 pub use state::{Account, FileStore, StateStore, UserState};
