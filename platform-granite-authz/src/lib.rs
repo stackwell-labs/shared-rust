@@ -10,8 +10,8 @@
 //!    and present the grant id in `x-approval-grant`;
 //! 2. the service asks Granite, with its own machine token, whether that grant
 //!    lets this caller (the grant's subject) use `scope` on `resource`;
-//! 3. the grant Granite returns must be on the request's plane
-//!    ([`Authenticated::plane`]).
+//! 3. the request's plane ([`Authenticated::plane`]) must be the plane of that
+//!    token, the plane Granite looks the grant up in.
 //!
 //! **Failure is never a 401.** The caller was already authenticated. A missing,
 //! malformed or unapproved grant is [`Refusal::Denied`] (403). Granite being
@@ -22,6 +22,15 @@
 //! writes one CloudWatch EMF line to stdout with its latency and whether Granite
 //! answered, per service and calling client, so a later cache decision rests on
 //! data (see [`METRIC_NAMESPACE`]).
+//!
+//! **The plane comes from this service's own token, not Granite's answer**
+//! (shared-rust#34). Granite verifies the service's token and looks the grant
+//! up on that token's plane (granite#94), so the grant it approves is always on
+//! the token's plane, and granite#96 drops the `environment` it used to echo.
+//! The token's `iss` names that plane ([`environment_from_issuer`]). A caller
+//! on another plane is [`Denied::WrongPlane`] before Granite is asked: in a
+//! service whose Authenticator also admits declared test tenants, that is what
+//! stops a Test caller using a Prod grant, or a Prod caller a Test one.
 //!
 //! **Configuration is not optional.** [`GraniteAuthz::new`] takes the Granite
 //! base URL and the service's [`MachineTokenMinter`] and refuses a blank or
@@ -37,10 +46,11 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use granite_client::{ActingUser, Auth, GraniteClient, GraniteError, VerifyGrantRequest};
 use http::{HeaderMap, StatusCode};
 use platform_chirp_auth::mint::{MachineTokenMinter, MintError};
-use platform_chirp_auth::{Authenticated, Caller};
+use platform_chirp_auth::{environment_from_issuer, Authenticated, Caller, Plane};
 use platform_http_error::ApiError;
 use uuid::Uuid;
 
@@ -100,7 +110,8 @@ pub enum Denied {
     /// Granite does not approve this grant for this caller, resource and scope
     /// (or knows no such grant). `reason` is Granite's, when it gave one.
     NotApproved { reason: Option<String> },
-    /// The grant was minted on another plane than the request's.
+    /// The request is on another plane than this service's own token, the
+    /// plane Granite looks grants up in. Granite is not asked.
     WrongPlane,
 }
 
@@ -148,8 +159,8 @@ impl From<Refusal> for ApiError {
     }
 }
 
-/// A grant Granite approved for this caller, resource and scope, on the
-/// request's plane.
+/// A grant Granite approved for this caller, resource and scope, looked up on
+/// the request's plane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authorized {
     /// The grant, as Granite returned it.
@@ -233,12 +244,8 @@ impl GraniteAuthz {
 
         let started = Instant::now();
         let result = self
-            .verify(grant_id, sub, &on_behalf_of, resource, scope)
-            .await
-            .and_then(|grant| match grant.assert_environment(&who.plane) {
-                Ok(()) => Ok(grant),
-                Err(_) => Err(Refusal::Denied(Denied::WrongPlane)),
-            });
+            .verify(&who.plane, grant_id, sub, &on_behalf_of, resource, scope)
+            .await;
         println!(
             "{}",
             emf_line(
@@ -257,6 +264,7 @@ impl GraniteAuthz {
 
     async fn verify(
         &self,
+        plane: &Plane,
         grant_id: Uuid,
         subject_sub: &str,
         on_behalf_of: &str,
@@ -275,6 +283,10 @@ impl GraniteAuthz {
                 MintError::Transient(_) => "machine-token mint failed".to_owned(),
             }))
         })?;
+        // Granite looks the grant up on the plane of the token it verifies.
+        if token_plane(&token)? != *plane {
+            return Err(Refusal::Denied(Denied::WrongPlane));
+        }
         let client = GraniteClient::with_http(
             self.base_url.as_str(),
             Auth::ChirpBearer(token),
@@ -318,6 +330,26 @@ impl GraniteAuthz {
             )))),
         }
     }
+}
+
+/// The plane of this service's own machine token: its `iss`, read without
+/// verifying it. The token came from this service's configured issuer, and
+/// Granite verifies it before trusting it; this only learns which plane Granite
+/// will look the grant up on. A token that names no issuer is a mint gone
+/// wrong, not a verdict on the caller's grant.
+fn token_plane(token: &str) -> Result<Plane, Refusal> {
+    let unreadable = || {
+        Refusal::Unavailable(Unavailable::new(
+            "this service's machine token names no issuer",
+        ))
+    };
+    let payload = token.split('.').nth(1).ok_or_else(unreadable)?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .map_err(|_| unreadable())?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).map_err(|_| unreadable())?;
+    let iss = claims["iss"].as_str().ok_or_else(unreadable)?;
+    Ok(environment_from_issuer(iss))
 }
 
 fn grant_id(headers: &HeaderMap) -> Result<Uuid, Refusal> {

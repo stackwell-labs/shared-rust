@@ -85,7 +85,9 @@ Shared chirp-auth request plumbing:
 The one Granite authoriser (shared-rust#21): `GraniteAuthz::authorize(&Authenticated,
 &headers, resource, scope)` reads the caller's `x-approval-grant` and `x-user-id`,
 asks Granite's `/v1/grants/verify` with the service's own machine token and the
-caller as subject, and returns the approved grant. Not approved is a 403;
+caller as subject, and returns the approved grant. A caller on another plane
+than the service's own token is a 403 before Granite is asked (shared-rust#34);
+not approved is a 403;
 Granite unreachable or a mint failure is a 503, never a 401. Online with no
 cache, and one EMF line per verify (latency, unavailable) per service and
 caller. See its README.

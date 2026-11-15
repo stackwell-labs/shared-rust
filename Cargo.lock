@@ -1930,8 +1930,9 @@ dependencies = [
 
 [[package]]
 name = "platform-granite-authz"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "base64",
  "granite-client",
  "http 1.4.1",
  "platform-chirp-auth",

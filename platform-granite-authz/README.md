@@ -35,13 +35,20 @@ sequenceDiagram
   machine sub today. A person is `Denied::NotAMachine` (person subjects wait on
   granite#82). It names the grant in `x-approval-grant` and the person it acts
   for in `x-user-id`; Granite binds that person to the grant's owner.
-- **The answer** is `Authorized { grant, on_behalf_of }`, only when Granite
-  approves *and* the grant was minted on the request's plane.
+- **The answer** is `Authorized { grant, on_behalf_of }`, only when the
+  request is on the plane of the service's own machine token and Granite
+  approves.
+- **The plane is the service token's** (shared-rust#34). Granite looks the
+  grant up on the plane of the token it verifies, the service's own, whose
+  `iss` names it. A caller on another plane (a Test caller of a Prod service,
+  or the reverse) is `Denied::WrongPlane` before Granite is asked. The grant's
+  `environment`, which Granite stops sending (granite#96), is not read.
 - **Never a 401.** `Denied` (403): no, blank or malformed grant id, no valid
-  `x-user-id`, not approved, unknown grant (Granite 404), or another plane.
+  `x-user-id`, another plane, not approved, or unknown grant (Granite 404).
   `Unavailable` (503): any answer that is no verdict on the grant: Granite
   unreachable, timed out (5 s), 5xx, 429, a 401/403 to the service's own token,
-  an undecodable answer, or the service's token failing to mint.
+  an undecodable answer, or the service's token failing to mint or naming no
+  issuer.
 - **Online, no cache.** Each call that reaches the mint/verify step prints one
   CloudWatch EMF line to stdout: namespace `Stackwell/GraniteAuthz`, dimensions
   `[Service, Caller]` (the caller's client id), metrics `VerifyLatency` (ms)
