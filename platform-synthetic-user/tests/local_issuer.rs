@@ -2,9 +2,10 @@
 //! `--features local-serve`, run as a hermetic local issuer (in-memory store,
 //! generated keys, nothing leaves the machine).
 //!
-//! The only privileged call is registering the relying party through the
-//! local control API, which is what an operator does for a real app. The
-//! user's own steps use only the public flows.
+//! The only privileged calls go through the local control API, as an operator
+//! would for a real app: registering the relying party and, for the shared
+//! Authenticator's resolver (shared-rust#41), a service's machine client and its
+//! `chirp.root_resolve` grant. The user's own steps use only the public flows.
 //!
 //! Ignored by default because it needs that binary. `../issuer` builds it at
 //! a pinned revision, and amber-ci's `synthetic-user` job runs these tests
@@ -680,4 +681,126 @@ async fn an_open_session_reads_the_account_pages_until_signed_out() {
     assert_ne!(after.status(), 200, "a signed-out session reads nothing");
 
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Register a system-owned confidential client through the operator path (no
+/// `owner_account_id`), and return its id and secret.
+async fn register_system_machine(issuer: &str, name: &str) -> (String, String) {
+    let response = reqwest::Client::new()
+        .post(format!("{issuer}/control/apps/confidential"))
+        .bearer_auth(LOCAL_CONTROL_TOKEN)
+        .header("origin", issuer)
+        .json(&json!({ "name": name, "environment": "dev" }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert!(status.is_success(), "register machine: {status} {body}");
+    (
+        body["client_id"].as_str().unwrap().to_owned(),
+        body["client_secret"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// shared-rust#41 against a real ChirpAuth: the shared Authenticator resolves a
+/// signed-in person's pairwise sub to their account through
+/// `/control/root-for-sub`, with this service's own machine token, holding
+/// the operator-granted `chirp.root_resolve` scope. A system-owned machine
+/// acts for nobody, `x-user-id` resolves the same way, and a client without
+/// the scope is an outage (503), never "no root".
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn the_authenticator_resolves_a_signed_in_person_to_their_account() {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use platform_chirp_auth::mint::{MachineTokenMinter, MintConfig};
+    use platform_chirp_auth::{
+        ActingFor, AuthFailure, Authenticator, Machines, PersonId, Policy, RootId, RootResolver,
+    };
+
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    register_public_client(&issuer).await;
+    let (service, secret) = register_system_machine(&issuer, "Resolving service").await;
+    let grant = reqwest::Client::new()
+        .post(format!("{issuer}/control/scopes/grant"))
+        .bearer_auth(LOCAL_CONTROL_TOKEN)
+        .header("origin", &issuer)
+        .json(&json!({ "scope": "chirp.root_resolve", "client_id": service }))
+        .send()
+        .await
+        .unwrap();
+    let status = grant.status();
+    assert!(
+        status.is_success(),
+        "grant chirp.root_resolve: {status} {}",
+        grant.text().await.unwrap()
+    );
+
+    let minter = Arc::new(MachineTokenMinter::new(MintConfig::new(
+        &issuer, &service, &secret,
+    )));
+    let policy = |resolver: RootResolver| Policy {
+        issuer: issuer.clone(),
+        humans: Some(BTreeSet::from([CLIENT_ID.to_owned()])),
+        machines: Machines::Allow(BTreeSet::from([service.clone()])),
+        test_tenants: None,
+        resolver: Some(resolver),
+    };
+    let resolver = RootResolver::new(&issuer, minter.clone(), reqwest::Client::new()).unwrap();
+    let auth = Authenticator::new(policy(resolver)).unwrap();
+
+    let dir = scratch_dir("person-id");
+    let mut user = SyntheticUser::enroll(
+        Issuer::new(&issuer).unwrap(),
+        "Synthetic person id",
+        FileStore::new(dir.join("user.json")),
+    )
+    .await
+    .expect("enroll");
+    let account = PersonId::Root(RootId::parse(user.account_id()).unwrap());
+    let signed_in = user.sign_in(&client()).await.expect("sign-in");
+    let sub = verified_sub(&issuer, &signed_in).await;
+
+    let person = auth
+        .verify(&signed_in.id_token)
+        .await
+        .expect("person verifies");
+    assert_eq!(person.person.as_ref(), Some(&account));
+    eprintln!("{sub} -> {account}");
+
+    let machine_token = minter.token().await.expect("mint the service's token");
+    let machine = auth.verify(&machine_token).await.expect("machine verifies");
+    assert_eq!(
+        machine.person, None,
+        "a system-owned machine acts for nobody"
+    );
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-user-id", sub.parse().unwrap());
+    assert_eq!(
+        auth.acting_for(&machine, &headers).await,
+        Ok(Some(ActingFor(account)))
+    );
+
+    // A client chirp has not granted root resolution: its resolver is refused
+    // (403), which is an outage, not "this person has no account".
+    let (ungranted, ungranted_secret) = register_system_machine(&issuer, "Ungranted service").await;
+    let ungranted = RootResolver::new(
+        &issuer,
+        Arc::new(MachineTokenMinter::new(MintConfig::new(
+            &issuer,
+            &ungranted,
+            &ungranted_secret,
+        ))),
+        reqwest::Client::new(),
+    )
+    .unwrap();
+    let refused = Authenticator::new(policy(ungranted)).unwrap();
+    assert_eq!(
+        refused.verify(&signed_in.id_token).await,
+        Err(AuthFailure::Unavailable)
+    );
 }

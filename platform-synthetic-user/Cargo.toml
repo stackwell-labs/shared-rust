@@ -32,3 +32,6 @@ tokio = { workspace = true }
 # The integration test verifies issued ID tokens with the same verifier every
 # platform relying party uses, not with a hand-rolled check.
 chirp-auth-client = { workspace = true }
+# The live test of the shared Authenticator's person resolution against a real
+# ChirpAuth (shared-rust#41).
+platform-chirp-auth = { path = "../platform-chirp-auth" }
