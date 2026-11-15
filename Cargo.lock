@@ -701,6 +701,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "capability"
+version = "0.5.0"
+source = "git+https://github.com/stackwell-labs/capability.git?tag=v0.5.0#0947c1a96210c7caa8c8578948ea312eed702665"
+
+[[package]]
 name = "cc"
 version = "1.2.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -737,11 +742,11 @@ dependencies = [
 
 [[package]]
 name = "chirp-auth-client"
-version = "0.18.0"
-source = "git+https://github.com/chirpauth/client-rust?tag=v0.18.0#069957ff3646e37dc2cbb62ccadd86288170c7c6"
+version = "0.19.0"
+source = "git+https://github.com/chirpauth/client-rust?tag=v0.19.0#91609db68d02d5a02a8aa14e04f2c19c59725c7f"
 dependencies = [
  "base64",
- "capability",
+ "capability 0.5.0",
  "http 1.4.1",
  "reqwest",
  "ring",
@@ -1206,7 +1211,7 @@ version = "0.15.0"
 source = "git+https://github.com/stackwell-labs/granite-client-rust.git?tag=v0.15.0#cf25337a0d26f0ffe6faff4b2f87e098455e3381"
 dependencies = [
  "base64",
- "capability",
+ "capability 0.4.0",
  "reqwest",
  "serde",
  "serde_json",
@@ -1884,7 +1889,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform-chirp-auth"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1930,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "platform-granite-authz"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "granite-client",

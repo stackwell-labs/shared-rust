@@ -23,9 +23,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chirp_auth_client::{
-    verify_chirp_id_token, ChirpAuthConfig, ChirpVerifiedIdentity, VerifyOptions,
-};
+use chirp_auth_client::{verify_chirp_id_token, Caller, ChirpAuthConfig, VerifyOptions};
 use platform_synthetic_user::{
     Error, FileStore, Issuer, PublicClient, StateStore, SyntheticUser, UserState,
 };
@@ -140,9 +138,10 @@ async fn verified_sub(issuer: &str, signed_in: &platform_synthetic_user::SignIn)
     )
     .await
     .expect("id_token verifies against the local JWKS");
-    let ChirpVerifiedIdentity::Human { sub } = verified.identity else {
-        panic!("expected a human identity, got {:?}", verified.identity);
+    let Caller::Human { sub, client_id } = verified.caller else {
+        panic!("expected a human identity, got {:?}", verified.caller);
     };
+    assert_eq!(client_id, CLIENT_ID, "verified for the registered client");
     let claims: Value = serde_json::from_slice(
         &URL_SAFE_NO_PAD
             .decode(signed_in.id_token.split('.').nth(1).unwrap())

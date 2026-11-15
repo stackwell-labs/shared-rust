@@ -9,11 +9,12 @@ use axum::routing::get;
 use axum::Router;
 use http::{HeaderMap, Request, StatusCode};
 use platform_chirp_auth::testkit::{
-    mint_human_id_token, mint_machine_id_token, mint_test_id_token, Fixture,
+    mint_human_id_token, mint_machine_id_token, mint_test_id_token, Fixture, TestSigningKey,
+    TEST_KID,
 };
 use platform_chirp_auth::{
     env, AllowlistUnavailable, AuthFailure, Authenticated, Authenticator, Caller, MachineAllowlist,
-    Machines, Plane, Policy,
+    Machines, Plane, Policy, ID_TOKEN_TYP,
 };
 use tower::ServiceExt as _;
 
@@ -158,6 +159,45 @@ async fn a_person_carries_the_client_their_token_was_for() {
             on(test_plane("tenant1"), human_at(sub, client))
         );
     }
+}
+
+/// A person's token naming two of the service's clients is refused: whose
+/// pairwise `sub` it is can't be told (shared-rust#27). chirp-auth-client
+/// applies the rule now (chirp-auth#186); this pins that it still reaches
+/// the service as a 401.
+#[tokio::test]
+async fn a_person_naming_two_accepted_clients_is_401() {
+    let fixture = Fixture::global();
+    let auth = Authenticator::new(Policy {
+        issuer: fixture.issuer().to_owned(),
+        humans: Some(set(&[RP, "cs_test_rp2"])),
+        machines: Machines::None,
+        test_tenants: None,
+    })
+    .unwrap();
+    let mint = |aud: serde_json::Value| {
+        TestSigningKey::new(TEST_KID).sign(
+            &serde_json::json!({"alg": "RS256", "typ": ID_TOKEN_TYP, "kid": TEST_KID}),
+            &serde_json::json!({
+                "iss": fixture.issuer(),
+                "sub": "sub_alice",
+                "aud": aud,
+                "exp": 4_102_444_800_i64, // 2100-01-01
+            }),
+        )
+    };
+
+    assert_eq!(
+        auth.verify(&mint(serde_json::json!([RP, "cs_test_rp2"])))
+            .await,
+        Err(AuthFailure::Unauthorized)
+    );
+    // One accepted client among others is that client.
+    assert_eq!(
+        auth.verify(&mint(serde_json::json!(["cs_other", RP])))
+            .await,
+        on(Plane::Prod, human_at("sub_alice", RP))
+    );
 }
 
 #[tokio::test]

@@ -43,7 +43,7 @@ axum-aws-lambda = "0.11"
 aws-config = { version = "1.8.8", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
 aws-sdk-dynamodb = { version = "1.95.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-sdk-secretsmanager = { version = "1.90.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-chirp-auth-client = { git = "https://github.com/chirpauth/client-rust", tag = "v0.18.0" }
+chirp-auth-client = { git = "https://github.com/chirpauth/client-rust", tag = "v0.19.0" }
 uuid = { version = "1", features = ["v4"] }
 # 0.1.92 is the first that stops adding a bare #[must_use] that clippy 1.99
 # flags as double_must_use (shared-rust#25).

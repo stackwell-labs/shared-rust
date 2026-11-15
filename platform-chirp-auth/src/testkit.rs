@@ -199,13 +199,13 @@ fn now_unix() -> i64 {
 }
 
 /// Mint a real, signed HUMAN chirp id_token: `{iss, sub, aud, exp}`, no
-/// `act` claim — verifies as `ChirpVerifiedIdentity::Human`.
+/// `act` claim — verifies as `Caller::Human`.
 pub fn mint_human_id_token(iss: &str, aud: &str, sub: &str) -> String {
     mint_id_token(json!({"iss": iss, "sub": sub, "aud": aud}))
 }
 
 /// Mint a real, signed MACHINE chirp id_token: `{iss, sub, aud, exp,
-/// act:"machine", owner_sub}` — verifies as `ChirpVerifiedIdentity::Machine`.
+/// act:"machine", owner_sub}` — verifies as `Caller::Machine`.
 /// `sub` is the machine's own agent sub; `owner_sub` is the human who
 /// registered the client; `aud` is conventionally the client_id.
 pub fn mint_machine_id_token(iss: &str, aud: &str, sub: &str, owner_sub: &str) -> String {
@@ -219,8 +219,8 @@ pub fn mint_machine_id_token(iss: &str, aud: &str, sub: &str, owner_sub: &str) -
 }
 
 /// Mint a real, signed TEST-keyset chirp id_token for a person: `{iss, sub,
-/// aud, exp, test: true}`. Verifies as `ChirpVerifiedIdentity::Test` against a
-/// `…/test/{tenant}` issuer (see [`Fixture::test_issuer`]).
+/// aud, exp, test: true}`. Verifies as `Caller::Human` on a test environment
+/// against a `…/test/{tenant}` issuer (see [`Fixture::test_issuer`]).
 pub fn mint_test_id_token(iss: &str, aud: &str, sub: &str) -> String {
     mint_id_token(json!({"iss": iss, "sub": sub, "aud": aud, "test": true}))
 }
@@ -234,7 +234,7 @@ pub fn config(iss: &str, aud: &str, jwks_url: String) -> ChirpAuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{verify_chirp_id_token, ChirpVerifiedIdentity, VerifyOptions};
+    use crate::{verify_chirp_id_token, Caller, VerifyOptions};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn mints_a_human_token_that_verifies_for_real() {
@@ -249,8 +249,11 @@ mod tests {
         )
         .await
         .expect("testkit token must verify against the testkit config");
-        match verified.identity {
-            ChirpVerifiedIdentity::Human { sub, .. } => assert_eq!(sub, "sub_alice"),
+        match verified.caller {
+            Caller::Human { sub, client_id } => {
+                assert_eq!(sub, "sub_alice");
+                assert_eq!(client_id, "cs_test_aud");
+            }
             other => panic!("expected Human, got {other:?}"),
         }
     }
@@ -269,8 +272,8 @@ mod tests {
         let verified = verify_chirp_id_token(&reqwest::Client::new(), &cfg, &token, opts)
             .await
             .expect("testkit machine token must verify");
-        match verified.identity {
-            ChirpVerifiedIdentity::Machine { sub, owner_sub, .. } => {
+        match verified.caller {
+            Caller::Machine { sub, owner_sub, .. } => {
                 assert_eq!(sub, "agent_bot1");
                 assert_eq!(owner_sub, "sub_alice");
             }

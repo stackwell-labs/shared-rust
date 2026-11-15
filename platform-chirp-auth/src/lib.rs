@@ -37,11 +37,14 @@ pub use chirp_auth_client::mint;
 /// v0.16.0 cascade). Depending only on `platform-chirp-auth` makes that drift
 /// unrepresentable: there is exactly one `chirp-auth-client`, the version THIS
 /// crate pins, and a bump is a single dependency edit.
+///
+/// [`Caller`] is the client's own verified principal, the one type an
+/// [`Authenticated`] carries (chirp-auth#186).
 pub use chirp_auth_client::{
     environment_from_issuer, verify_chirp_id_token, verify_chirp_resource_access_token,
-    verify_from_headers, verify_rs256_jws, ChirpAuthConfig, ChirpAuthError, ChirpVerifiedIdentity,
-    ChirpVerifiedResourceAccess, ChirpVerifiedToken, Claims, Environment, VerifyOptions,
-    ACCESS_TOKEN_TYP, ID_TOKEN_TYP, KEYBIND_TYP,
+    verify_from_headers, verify_rs256_jws, Caller, ChirpAuthConfig, ChirpAuthError,
+    ChirpVerifiedResourceAccess, Claims, Environment, Verified, VerifyOptions, ACCESS_TOKEN_TYP,
+    ID_TOKEN_TYP, KEYBIND_TYP,
 };
 /// Re-export the ChirpAuth event verifier (chirp-auth#87), so a service that
 /// receives Chirp's `user.deleted` webhook needs no direct chirp-auth-client
@@ -66,7 +69,7 @@ pub mod testkit;
 
 mod authenticator;
 pub use authenticator::{
-    env, AllowlistUnavailable, AuthFailure, Authenticated, Authenticator, Caller, ConfigError,
+    env, AllowlistUnavailable, AuthFailure, Authenticated, Authenticator, ConfigError,
     MachineAllowlist, Machines, Plane, Policy,
 };
 
@@ -612,8 +615,8 @@ impl MachineAuth {
                 }
             };
         let environment = verified.environment;
-        match verified.identity {
-            ChirpVerifiedIdentity::Machine {
+        match verified.caller {
+            Caller::Machine {
                 sub,
                 owner_sub,
                 client_id,
@@ -624,13 +627,10 @@ impl MachineAuth {
                 environment,
                 issuer: self.config.issuer().to_owned(),
             }),
-            // A human or test-environment token on the machine path is the wrong
-            // identity type, but it is a VALID token — the caller falls through to
-            // its human path. (`Test` is a non-machine principal verified against a
-            // test-tenant keyset; added to ChirpVerifiedIdentity in client v0.13.)
-            ChirpVerifiedIdentity::Human { .. } | ChirpVerifiedIdentity::Test { .. } => {
-                Err(MachineAuthError::NotMachine)
-            }
+            // A person's token on the machine path is the wrong identity type,
+            // but it is a VALID token — the caller falls through to its human
+            // path.
+            Caller::Human { .. } => Err(MachineAuthError::NotMachine),
         }
     }
 }

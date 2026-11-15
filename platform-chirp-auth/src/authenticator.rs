@@ -55,8 +55,8 @@ use http::request::Parts;
 use platform_http_error::ApiError;
 
 use crate::{
-    bearer_token, environment_from_issuer, verify_chirp_id_token, ChirpAuthConfig, ChirpAuthError,
-    ChirpVerifiedIdentity, Environment, VerifyFailure, VerifyOptions,
+    bearer_token, environment_from_issuer, verify_chirp_id_token, Caller, ChirpAuthConfig,
+    ChirpAuthError, Environment, VerifyFailure, VerifyOptions,
 };
 
 /// Which data plane a request belongs to: `Prod`, or `Test { tenant }` for a
@@ -132,39 +132,14 @@ pub trait MachineAllowlist: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllowlistUnavailable;
 
-/// A verified chirp principal. Which plane it acts on is the [`Plane`] beside
-/// it in [`Authenticated`], not part of it: the same `sub` on two planes is two
-/// different callers.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Caller {
-    /// A person signed in to this service: their pairwise `sub`, and the
-    /// `client_id` of the Chirp client (one of [`Policy::humans`]) the token
-    /// was minted for and verified against. Chirp mints a pairwise `sub` per
-    /// (person, client), so the two together name the person
-    /// (shared-rust#27).
-    Human { sub: String, client_id: String },
-    /// A confidential client: the agent `sub`, the person who registered the
-    /// client (`owner_sub`), and the minting `client_id`, already checked
-    /// against [`Machines`].
-    Machine {
-        sub: String,
-        owner_sub: String,
-        client_id: String,
-    },
-}
-
-impl Caller {
-    /// The verified `sub`, whatever the variant.
-    pub fn sub(&self) -> &str {
-        match self {
-            Self::Human { sub, .. } | Self::Machine { sub, .. } => sub,
-        }
-    }
-}
-
 /// A verified request: who ([`Caller`]) and on which [`Plane`]. The plane is
 /// one of [`Authenticator::planes`], decided by the keyset that verified the
 /// token.
+///
+/// [`Caller`] is chirp-auth-client's (chirp-auth#186): a person's `client_id`
+/// is the one accepted audience their token was verified against, and it
+/// carries no environment, so the same `sub` on two planes is two different
+/// callers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authenticated {
     pub caller: Caller,
@@ -358,46 +333,14 @@ impl Authenticator {
                 },
             })?;
         // The plane is the verifying keyset's (provenance), never the token
-        // kind's: chirp-auth-client returns a test-keyset machine token as
-        // `Machine`, with a test environment.
-        // chirp-auth-client checked a person's `aud` against the accepted set
-        // but returns only the `sub`. Which client it was is read from the
-        // same claims segment it just verified (shared-rust#27).
-        let human = |sub: String| {
-            unverified
-                .accepted_audience(config.accepted_audiences())
-                .map(|client_id| Caller::Human { sub, client_id })
-                .ok_or(AuthFailure::Unauthorized)
-        };
-        let caller = match (&verified.environment, verified.identity) {
-            (Environment::Prod, ChirpVerifiedIdentity::Human { sub }) => human(sub)?,
-            // chirp-auth-client builds `Test` only from a test keyset; refuse
-            // rather than trust a production one that claims it.
-            (Environment::Prod, ChirpVerifiedIdentity::Test { .. }) => {
-                return Err(AuthFailure::Unauthorized)
-            }
-            (
-                Environment::Test { .. },
-                ChirpVerifiedIdentity::Human { sub } | ChirpVerifiedIdentity::Test { sub },
-            ) => human(sub)?,
-            (
-                _,
-                ChirpVerifiedIdentity::Machine {
-                    sub,
-                    owner_sub,
-                    client_id,
-                },
-            ) => {
-                self.admit_machine(&client_id).await?;
-                Caller::Machine {
-                    sub,
-                    owner_sub,
-                    client_id,
-                }
-            }
-        };
+        // kind's, and the client already matched the person's `aud` to one
+        // accepted audience (chirp-auth#186). Only a dynamic machine allowlist
+        // is left to check.
+        if let Caller::Machine { client_id, .. } = &verified.caller {
+            self.admit_machine(client_id).await?;
+        }
         Ok(Authenticated {
-            caller,
+            caller: verified.caller,
             plane: verified.environment,
         })
     }
@@ -416,48 +359,15 @@ impl Authenticator {
     }
 }
 
-/// The claims of a JWT that [`Authenticator::verify`] reads itself, decoded
-/// without a signature check. `iss` only picks a keyset; `aud` is read only
-/// once chirp-auth-client has verified this same segment.
+/// The one claim [`Authenticator::verify`] reads itself, decoded without a
+/// signature check: `iss`, which only picks a keyset.
 #[derive(serde::Deserialize)]
 struct UnverifiedClaims {
     iss: String,
-    #[serde(default)]
-    aud: Option<Audience>,
-}
-
-/// A JWT `aud`: one string or an array (RFC 7519 §4.1.3).
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum Audience {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl UnverifiedClaims {
-    /// The one `aud` value in `accepted`. `None` when there is none, or when
-    /// the token names several accepted audiences: then which client its
-    /// pairwise `sub` belongs to is ambiguous, so it is refused rather than
-    /// guessed at. (Chirp mints a person's id_token for one client.)
-    fn accepted_audience(&self, accepted: &BTreeSet<String>) -> Option<String> {
-        let values = match self.aud.as_ref()? {
-            Audience::One(aud) => std::slice::from_ref(aud),
-            Audience::Many(auds) => auds.as_slice(),
-        };
-        let matched: BTreeSet<&String> = values
-            .iter()
-            .filter(|aud| accepted.contains(*aud))
-            .collect();
-        let mut matched = matched.into_iter();
-        match (matched.next(), matched.next()) {
-            (Some(aud), None) => Some(aud.clone()),
-            _ => None,
-        }
-    }
 }
 
 /// The claims of a JWT, unverified. `None` for anything that is not a JWT
-/// with a string `iss` (and, if present, a string or string-array `aud`).
+/// with a string `iss`.
 fn unverified_claims(token: &str) -> Option<UnverifiedClaims> {
     let claims = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(claims).ok()?;
@@ -539,33 +449,5 @@ pub mod env {
             return Err(ConfigError(format!("{name} names no entries")));
         }
         Ok(set)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn claims(json: &str) -> UnverifiedClaims {
-        serde_json::from_str(json).expect("claims parse")
-    }
-
-    #[test]
-    fn the_accepted_audience_is_the_one_match() {
-        let accepted: BTreeSet<String> = ["cs_a".to_owned(), "cs_b".to_owned()].into();
-        let pick = |json| claims(json).accepted_audience(&accepted);
-        assert_eq!(pick(r#"{"iss":"i","aud":"cs_b"}"#).as_deref(), Some("cs_b"));
-        assert_eq!(
-            pick(r#"{"iss":"i","aud":["cs_other","cs_a"]}"#).as_deref(),
-            Some("cs_a")
-        );
-        assert_eq!(
-            pick(r#"{"iss":"i","aud":["cs_a","cs_a"]}"#).as_deref(),
-            Some("cs_a")
-        );
-        // Two accepted clients: whose pairwise sub it is can't be told.
-        assert_eq!(pick(r#"{"iss":"i","aud":["cs_a","cs_b"]}"#), None);
-        assert_eq!(pick(r#"{"iss":"i","aud":"cs_other"}"#), None);
-        assert_eq!(pick(r#"{"iss":"i"}"#), None);
     }
 }

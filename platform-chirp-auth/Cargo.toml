@@ -90,7 +90,16 @@ name = "platform-chirp-auth"
 # takes the client from the caller instead of re-decoding the bearer.
 # BREAKING for a `Caller::Human { sub }` pattern or literal without `..`:
 # add `client_id` (or `..`).
-version = "0.9.0"
+# 0.10.0 (shared-rust#40, repo tag v0.14.0) takes chirp-auth-client v0.19.0
+# (chirp-auth#186): `Caller` is now the client's, re-exported, same shape, and
+# the client fills a person's `client_id` from the audience it verified, so the
+# unverified `aud` re-read is gone. BREAKING: `ChirpVerifiedIdentity` and
+# `ChirpVerifiedToken` are no longer re-exported (the client deleted them);
+# code calling `verify_chirp_id_token` directly matches `Verified { caller, .. }`
+# with `Caller::Human`/`Machine`. `Verified` is re-exported. A service that also
+# depends on chirp-auth-client directly must move it to v0.19.0, or its
+# `Caller` is a different type.
+version = "0.10.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
