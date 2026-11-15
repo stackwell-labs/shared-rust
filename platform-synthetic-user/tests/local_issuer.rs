@@ -643,3 +643,42 @@ async fn a_deletion_cut_short_resumes_from_the_store() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "needs CHIRP_AUTH_SERVICE_BIN (chirp-service --features local-serve)"]
+async fn an_open_session_reads_the_account_pages_until_signed_out() {
+    let local = start_issuer().await;
+    let issuer = local.issuer.clone();
+    let dir = scratch_dir("session");
+    let live = dir.join("user.json");
+    enroll(&issuer, &live).await;
+
+    let mut user = load(&issuer, FileStore::new(&live)).await;
+    let session = user.open_session().await.expect("open session");
+    assert!(session.cookie().starts_with("chirp_auth_session="));
+    let cookie = session.cookie().to_string();
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let consents = |cookie: String| {
+        let http = http.clone();
+        let url = format!("{issuer}/account/consents");
+        async move { http.get(url).header("cookie", cookie).send().await.unwrap() }
+    };
+    let page = consents(cookie.clone()).await;
+    assert_eq!(
+        page.status(),
+        200,
+        "the session reads its own consents page"
+    );
+
+    session
+        .sign_out(&Issuer::new(&issuer).unwrap())
+        .await
+        .expect("sign out");
+    let after = consents(cookie).await;
+    assert_ne!(after.status(), 200, "a signed-out session reads nothing");
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}

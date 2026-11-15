@@ -11,7 +11,9 @@
 //!   [`SyntheticUser::enroll`] (passkey signup), [`SyntheticUser::authorize`]
 //!   (any `/authorize` URL → the RP callback with a code),
 //!   [`SyntheticUser::sign_in`] (a public PKCE client end to end),
-//!   [`SyntheticUser::rotate_passkey`] (a new key on the same account), and
+//!   [`SyntheticUser::open_session`] (a session on the account's own
+//!   pages), [`SyntheticUser::rotate_passkey`] (a new key on the same
+//!   account), and
 //!   [`SyntheticUser::delete_account`] (the account erased, as its holder
 //!   would erase it).
 //!
@@ -40,6 +42,6 @@ mod error;
 pub mod state;
 
 pub use authenticator::Credential;
-pub use driver::{Issuer, PublicClient, SignIn, SyntheticUser};
+pub use driver::{AccountSession, Issuer, PublicClient, SignIn, SyntheticUser};
 pub use error::Error;
 pub use state::{Account, FileStore, StateStore, UserState};

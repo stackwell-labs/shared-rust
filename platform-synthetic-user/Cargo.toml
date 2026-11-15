@@ -7,7 +7,8 @@ name = "platform-synthetic-user"
 # 0.3.0: sign_in_with_consent, through a session and the "Continue as" click
 # (the only way to ChirpAuth's chirp.control scope; shared-rust#32).
 # 0.4.0: delete_account, through the hosted deletion page (shared-rust#30).
-version = "0.4.0"
+# 0.5.0: open_session, a session on the account's own pages (chirp-auth#9).
+version = "0.5.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

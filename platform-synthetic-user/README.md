@@ -74,6 +74,10 @@ sequenceDiagram
   person: a ChirpAuth session first, then the client's `/authorize` in it and
   the "Continue as" click, then sign-out. ChirpAuth grants `chirp.control`
   (its CLI client's scope, which its operator routes require) only this way.
+- `user.open_session()`: a ChirpAuth session on the account's own pages
+  (contact email, `/account/consents`), for a live check that drives them
+  as a person would. Send `session.cookie()` on each request and an
+  `Origin` of the issuer on each POST; end it with `session.sign_out(&issuer)`.
 - `user.rotate_passkey()`: a new key on the same account, the old one
   removed. The account must hold exactly one passkey. If it is cut short,
   `state().is_rotating()` is true and calling it again finishes it.

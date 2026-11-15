@@ -528,6 +528,19 @@ impl<S: StateStore> SyntheticUser<S> {
         request.redeem(&self.issuer, client, &callback).await
     }
 
+    /// Sign in to ChirpAuth's own account surface (no relying party) and
+    /// return the session, for a live check that drives the hosted account
+    /// pages a person uses: the contact email, `/account/consents` and its
+    /// forms. Send the session's [`AccountSession::cookie`] on each request,
+    /// and an `Origin` of the issuer on each POST, as the hosted pages do.
+    ///
+    /// The caller ends it with [`AccountSession::sign_out`], so no live
+    /// session outlasts the check.
+    pub async fn open_session(&mut self) -> Result<AccountSession, Error> {
+        self.ensure_live()?;
+        self.account_session(Key::Current).await
+    }
+
     /// Rotate this account's passkey in place: register a new software
     /// passkey on the account, sign in with it once, then remove the old one.
     /// The account, its id and every grant keyed on it stay as they were;
@@ -820,14 +833,21 @@ impl<S: StateStore> SyntheticUser<S> {
     }
 }
 
-/// A signed-in session on ChirpAuth's own account surface. `Debug` is not
-/// derived: the cookie is a bearer secret.
-struct AccountSession {
+/// A signed-in session on ChirpAuth's own account surface, from
+/// [`SyntheticUser::open_session`]. `Debug` is not derived: the cookie is a
+/// bearer secret.
+pub struct AccountSession {
     /// `chirp_auth_session=<token>`, as a `Cookie` header carries it.
     cookie: String,
 }
 
 impl AccountSession {
+    /// The session as a `Cookie` header carries it
+    /// (`chirp_auth_session=<token>`). A bearer secret: never log it.
+    pub fn cookie(&self) -> &str {
+        &self.cookie
+    }
+
     /// Open `authorize_url` in this session and submit its "Continue as"
     /// form. Returns the callback URL the code is sent to, checked as
     /// [`SyntheticUser::authorize`] checks its own.
@@ -922,8 +942,8 @@ impl AccountSession {
         Ok(())
     }
 
-    /// End the session, so no live session outlasts the rotation.
-    async fn sign_out(self, issuer: &Issuer) -> Result<(), Error> {
+    /// End the session at the issuer, so no live session outlasts its use.
+    pub async fn sign_out(self, issuer: &Issuer) -> Result<(), Error> {
         let response = issuer
             .post(issuer.url("/logout"), Some(&self))
             .form(NO_FORM)
