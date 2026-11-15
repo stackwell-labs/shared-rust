@@ -24,6 +24,13 @@
 //!   is [`AuthFailure::RejectedMachine`], never retried as a human.
 //! - **A ChirpAuth outage is [`AuthFailure::Unavailable`], a 503** (via
 //!   [`VerifyFailure`]), never a 401.
+//! - **Which person a request is about is decided here, once** (shared-rust#41,
+//!   agent-platform--protocols `docs/adr-one-person-id.md`): each verified
+//!   request carries its [`PersonId`], a production caller's chirp root from
+//!   the one cached [`RootResolver`] in the [`Policy`], a test caller's sub as
+//!   is. A machine's person is its owner. Only chirp's `404 no_root_for_sub`
+//!   means "no root"; any other resolver failure is a 503. `x-user-id` becomes
+//!   an [`ActingFor`] the same way ([`Authenticator::acting_for`]).
 //!
 //! The JWKS cache and fetch timeout stay in chirp-auth-client. A service keeps
 //! only the mapping from [`Caller`] to its own user type and any product
@@ -37,9 +44,10 @@
 //!     humans: Some(env::human_audiences("GRANITE")?),
 //!     machines: Machines::Allow(env::machine_clients("GRANITE")?),
 //!     test_tenants: Some(["journeys".to_owned()].into()),
+//!     resolver: Some(RootResolver::new(&chirp_base_url, minter, http)?),
 //! })?;
 //! // At boot: one store handle per `auth.planes()`.
-//! // In a handler: `Authenticated { caller, plane }` (the axum extractor, with
+//! // In a handler: `Authenticated { caller, plane, person }` (the axum extractor, with
 //! // `Authenticator: FromRef<State>`), or `auth.authenticate(&headers).await?`.
 //! ```
 
@@ -55,8 +63,9 @@ use http::request::Parts;
 use platform_http_error::ApiError;
 
 use crate::{
-    bearer_token, environment_from_issuer, verify_chirp_id_token, Caller, ChirpAuthConfig,
-    ChirpAuthError, Environment, VerifyFailure, VerifyOptions,
+    bearer_token, environment_from_issuer, verify_chirp_id_token, ActingFor, Caller,
+    ChirpAuthConfig, ChirpAuthError, Environment, PairwiseSub, PersonId, RootResolver,
+    VerifyFailure, VerifyOptions, USER_ID_HEADER,
 };
 
 /// Which data plane a request belongs to: `Prod`, or `Test { tenant }` for a
@@ -91,6 +100,12 @@ pub struct Policy {
     /// gets a 401. `None`: only `issuer`'s plane. Declare one only once the
     /// service has a store for its plane. Needs a production `issuer`.
     pub test_tenants: Option<BTreeSet<String>>,
+    /// Resolves a production caller's pairwise sub to their [`PersonId::Root`].
+    /// Required with a production `issuer` (every policy accepts someone, and a
+    /// production caller must be resolved), and refused with a test-tenant
+    /// `issuer`, whose callers are never resolved. Build it from the chirp
+    /// base URL (the production issuer) and this service's own minter.
+    pub resolver: Option<RootResolver>,
 }
 
 /// Which machine (`client_credentials`) tokens a service accepts, by the
@@ -132,9 +147,9 @@ pub trait MachineAllowlist: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllowlistUnavailable;
 
-/// A verified request: who ([`Caller`]) and on which [`Plane`]. The plane is
-/// one of [`Authenticator::planes`], decided by the keyset that verified the
-/// token.
+/// A verified request: who ([`Caller`]), on which [`Plane`], and about which
+/// person ([`PersonId`]). The plane is one of [`Authenticator::planes`],
+/// decided by the keyset that verified the token.
 ///
 /// [`Caller`] is chirp-auth-client's (chirp-auth#186): a person's `client_id`
 /// is the one accepted audience their token was verified against, and it
@@ -144,6 +159,12 @@ pub struct AllowlistUnavailable;
 pub struct Authenticated {
     pub caller: Caller,
     pub plane: Plane,
+    /// The person: for a [`Caller::Human`], always `Some` (a person chirp has
+    /// no root for is refused, [`AuthFailure::NoPerson`]); for a
+    /// [`Caller::Machine`], its owner, or `None` for a machine no person owns
+    /// (a system-owned client, whose owner sub chirp resolves to no account).
+    /// Key and compare people by this, never by a sub.
+    pub person: Option<PersonId>,
 }
 
 /// Why [`Authenticator::authenticate`] yielded no caller.
@@ -155,15 +176,19 @@ pub enum AuthFailure {
     /// A verified machine token from a client this service does not accept.
     /// Definitive: do not try the bearer as any other credential. 401.
     RejectedMachine,
-    /// ChirpAuth's JWKS (or a [`MachineAllowlist`]) could not be read, so the
-    /// token was never judged. Do not fall through. 503.
+    /// A verified person token (or `x-user-id`) whose sub chirp says belongs
+    /// to no account (`404 no_root_for_sub`): there is no person to act as.
+    /// Definitive, like [`Self::RejectedMachine`]. 401.
+    NoPerson,
+    /// ChirpAuth's JWKS, its root resolver, or a [`MachineAllowlist`] could
+    /// not be read, so the request was never judged. Do not fall through. 503.
     Unavailable,
 }
 
 impl From<AuthFailure> for ApiError {
     fn from(failure: AuthFailure) -> Self {
         match failure {
-            AuthFailure::Unauthorized | AuthFailure::RejectedMachine => {
+            AuthFailure::Unauthorized | AuthFailure::RejectedMachine | AuthFailure::NoPerson => {
                 VerifyFailure::Invalid.into()
             }
             AuthFailure::Unavailable => VerifyFailure::Unavailable.into(),
@@ -209,6 +234,8 @@ struct Inner {
     planes: Vec<Plane>,
     options: VerifyOptions,
     machines: Machines,
+    /// `Some` exactly when [`Plane::Prod`] is served.
+    resolver: Option<RootResolver>,
     http: reqwest::Client,
 }
 
@@ -216,7 +243,8 @@ impl Authenticator {
     /// Check `policy` and build the authenticator. Entries are trimmed. Refuses
     /// a blank issuer, an empty audience, client or tenant set (say `None`
     /// instead), a policy accepting neither humans nor machines, a tenant that
-    /// is not one path segment, and test tenants beside a test issuer.
+    /// is not one path segment, test tenants beside a test issuer, and a
+    /// resolver missing beside a production issuer or given to a test one.
     pub fn new(policy: Policy) -> Result<Self, ConfigError> {
         let issuer = policy.issuer.trim().trim_end_matches('/').to_owned();
         if issuer.is_empty() {
@@ -278,7 +306,21 @@ impl Authenticator {
                 (config.issuer().to_owned(), config)
             })
             .collect();
-        let planes = configs.values().map(ChirpAuthConfig::environment).collect();
+        let planes: Vec<Plane> = configs.values().map(ChirpAuthConfig::environment).collect();
+        let resolver = match (planes.contains(&Plane::Prod), policy.resolver) {
+            (true, Some(resolver)) => Some(resolver),
+            (true, None) => {
+                return Err(ConfigError(
+                    "a production issuer needs a root resolver: every production caller is resolved to its person".to_owned(),
+                ))
+            }
+            (false, None) => None,
+            (false, Some(_)) => {
+                return Err(ConfigError(format!(
+                    "{issuer} is a test tenant's issuer, whose callers are never resolved; say None for the resolver"
+                )))
+            }
+        };
         Ok(Self {
             inner: Arc::new(Inner {
                 issuer,
@@ -286,6 +328,7 @@ impl Authenticator {
                 planes,
                 options,
                 machines,
+                resolver,
                 http: reqwest::Client::new(),
             }),
         })
@@ -339,10 +382,68 @@ impl Authenticator {
         if let Caller::Machine { client_id, .. } = &verified.caller {
             self.admit_machine(client_id).await?;
         }
+        let plane = verified.environment;
+        let person = match &verified.caller {
+            Caller::Human { sub, .. } => Some(self.person(&plane, sub).await?),
+            // A machine no person owns resolves to no root; that is not a
+            // refusal, the machine just acts for nobody.
+            Caller::Machine { owner_sub, .. } => match self.person(&plane, owner_sub).await {
+                Ok(owner) => Some(owner),
+                Err(AuthFailure::NoPerson) => None,
+                Err(other) => return Err(other),
+            },
+        };
         Ok(Authenticated {
             caller: verified.caller,
-            plane: verified.environment,
+            plane,
+            person,
         })
+    }
+
+    /// The person a request's `x-user-id` names, resolved on the request's
+    /// plane the same way its caller's person is: a production pairwise sub to
+    /// its root, a test sub as is. `Ok(None)` when the header is absent.
+    ///
+    /// The header is the caller's claim, so this is no permission to act for
+    /// anyone: check a grant before acting on the [`ActingFor`]. A malformed
+    /// header is [`AuthFailure::Unauthorized`], a sub with no account
+    /// [`AuthFailure::NoPerson`], a resolver outage [`AuthFailure::Unavailable`].
+    pub async fn acting_for(
+        &self,
+        who: &Authenticated,
+        headers: &http::HeaderMap,
+    ) -> Result<Option<ActingFor>, AuthFailure> {
+        let Some(value) = headers.get(USER_ID_HEADER) else {
+            return Ok(None);
+        };
+        let sub = value.to_str().map_err(|_| AuthFailure::Unauthorized)?;
+        Ok(Some(ActingFor(self.person(&who.plane, sub).await?)))
+    }
+
+    /// `sub`'s person on `plane`. A production sub must be a pairwise sub
+    /// (`sub_…`); a test one must be a well-formed id (see [`test_person`]).
+    async fn person(&self, plane: &Plane, sub: &str) -> Result<PersonId, AuthFailure> {
+        if let Plane::Test { tenant } = plane {
+            return test_person(tenant, sub);
+        }
+        let resolver = self
+            .inner
+            .resolver
+            .as_ref()
+            .expect("Authenticator::new requires a resolver whenever Prod is served");
+        let sub = PairwiseSub::parse(sub).map_err(|_| AuthFailure::Unauthorized)?;
+        match resolver.person_root(&sub).await {
+            Ok(Some(root)) => Ok(PersonId::Root(root)),
+            Ok(None) => Err(AuthFailure::NoPerson),
+            Err(unavailable) => {
+                tracing::warn!(
+                    route = unavailable.route(),
+                    reason = unavailable.reason(),
+                    "chirp root resolve failed; answering 503"
+                );
+                Err(AuthFailure::Unavailable)
+            }
+        }
     }
 
     /// The [`Machines::Dynamic`] check, made after the token verifies. The
@@ -372,6 +473,22 @@ fn unverified_claims(token: &str) -> Option<UnverifiedClaims> {
     let claims = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(claims).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// A test plane's person. The sub is whatever the test tenant minted, so it is
+/// only checked to be an id: 1 to [`MAX_ID_LEN`](crate::ids::MAX_ID_LEN)
+/// printable, non-space ASCII bytes, untrimmed.
+fn test_person(tenant: &str, sub: &str) -> Result<PersonId, AuthFailure> {
+    let ok = !sub.is_empty()
+        && sub.len() <= crate::ids::MAX_ID_LEN
+        && sub.bytes().all(|b| b.is_ascii_graphic());
+    if !ok {
+        return Err(AuthFailure::Unauthorized);
+    }
+    Ok(PersonId::Test {
+        tenant: tenant.to_owned(),
+        sub: sub.to_owned(),
+    })
 }
 
 fn non_empty(set: BTreeSet<String>, what: &str) -> Result<BTreeSet<String>, ConfigError> {

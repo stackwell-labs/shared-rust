@@ -99,7 +99,21 @@ name = "platform-chirp-auth"
 # with `Caller::Human`/`Machine`. `Verified` is re-exported. A service that also
 # depends on chirp-auth-client directly must move it to v0.19.0, or its
 # `Caller` is a different type.
-version = "0.10.0"
+# 0.11.0 (shared-rust#41, repo tag v0.15.0) decides which person a request is
+# about once, here (agent-platform--protocols docs/adr-one-person-id.md):
+# `Authenticated` gains `person: Option<PersonId>` (`Root(RootId)` on Prod,
+# resolved through one cached `RootResolver`; `Test { tenant, sub }` on a test
+# plane, never resolved; a machine's is its owner's, `None` for a system-owned
+# client), and `Authenticator::acting_for` turns `x-user-id` into an
+# `ActingFor(PersonId)` the same way. Only chirp's `404 no_root_for_sub` is "no
+# root": a person with none is the new `AuthFailure::NoPerson` (401), and any
+# other resolver failure is a 503. The testkit's `Fixture` serves chirp's
+# `/token` and root-for-sub (`root_resolver()`, `throttled_root_resolver()`,
+# `root_for_sub`). BREAKING: `Policy` gains `resolver`, required with a
+# production issuer and refused with a test tenant's (construction fails, not
+# requests); `Authenticated` literals and exhaustive `AuthFailure` matches
+# gain the new field and variant.
+version = "0.11.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -130,6 +144,8 @@ serde_json = { workspace = true }
 # Reads a token's unverified `iss` to pick which plane's keyset verifies it.
 base64 = "0.22"
 platform-http-error = { path = "../platform-http-error" }
+# Logs why a root resolve failed before answering 503 (the AuthFailure carries no reason).
+tracing = { workspace = true }
 # ── testkit's deps (optional; see the `testkit` feature) ────────────────────
 # The fixture's own runtime thread and its 429 issuer.
 tokio = { workspace = true, optional = true, features = ["io-util"] }

@@ -22,13 +22,14 @@
 //! # }
 //! ```
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::{ChirpAuthConfig, ID_TOKEN_TYP};
+use crate::mint::{MachineTokenMinter, MintConfig};
+use crate::{ChirpAuthConfig, RootResolver, ID_TOKEN_TYP};
 
 /// ChirpAuth event tokens for a webhook receiver's tests (shared-rust#17):
 /// chirp-auth-client's own event-signing kit, re-exported so those tests need
@@ -99,8 +100,76 @@ async fn serve_throttled(listener: TcpListener) {
     }
 }
 
-/// A process-wide pair of local ChirpAuth issuers for tests: one serving the
-/// testkit JWKS, one answering every JWKS fetch with a 429 throttle.
+/// The sub prefix the testkit's chirp control stand-in answers
+/// `no_root_for_sub` for: `sub_noroot`, `sub_noroot_system`, ….
+pub const NO_ROOT_SUB_PREFIX: &str = "sub_noroot";
+
+/// The root the testkit's chirp control stand-in gives `sub`, or `None` for
+/// `no_root_for_sub`: `sub_{person}` and `sub_{person}.{client}` both belong to
+/// `usr_{person}`, so a test can give one person a pairwise sub per client; a
+/// sub starting with [`NO_ROOT_SUB_PREFIX`] has no root (a system-owned
+/// machine's owner, or an erased account). Not a `sub_…` id: `None` too.
+pub fn root_for_sub(sub: &str) -> Option<String> {
+    if sub.starts_with(NO_ROOT_SUB_PREFIX) {
+        return None;
+    }
+    let person = sub.strip_prefix("sub_")?;
+    let person = person.split('.').next().filter(|p| !p.is_empty())?;
+    Some(format!("usr_{person}"))
+}
+
+/// Serve chirp's two routes a [`RootResolver`] uses: `/token` (any client's
+/// credentials get a machine token) and `/control/root-for-sub` (the bearer
+/// must be present; the answer is [`root_for_sub`]'s).
+async fn serve_control(listener: TcpListener) {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::Json;
+
+    async fn token() -> Json<Value> {
+        let token = mint_machine_id_token(
+            "https://chirp.testkit.invalid",
+            "cs_testkit_service",
+            "agent_testkit_service",
+            "sub_noroot_system",
+        );
+        Json(json!({ "id_token": token, "expires_in": 3600 }))
+    }
+
+    async fn root(headers: HeaderMap, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+        let bearer = crate::bearer_token(&headers).is_some();
+        let sub = body.get("sub").and_then(Value::as_str);
+        match (bearer, sub) {
+            (false, _) => (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthorized" })),
+            ),
+            (true, None) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "bad_request" })),
+            ),
+            (true, Some(sub)) => match root_for_sub(sub) {
+                Some(root) => (
+                    StatusCode::OK,
+                    Json(json!({ "root_id": root, "current": true })),
+                ),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": "no_root_for_sub" })),
+                ),
+            },
+        }
+    }
+
+    let app = axum::Router::new()
+        .route("/token", post(token))
+        .route(crate::control::ROOT_FOR_SUB_PATH, post(root));
+    let _ = axum::serve(listener, app).await;
+}
+
+/// A process-wide set of local ChirpAuth stand-ins for tests: an issuer
+/// serving the testkit JWKS, one answering every request with a 429 throttle,
+/// and chirp's control routes for a [`RootResolver`] ([`Fixture::root_resolver`]).
 ///
 /// Both run on a dedicated thread with its own runtime that lives as long as
 /// the test process, so every test in a binary, whatever its runtime, can use
@@ -122,6 +191,7 @@ async fn serve_throttled(listener: TcpListener) {
 pub struct Fixture {
     issuer: String,
     throttled_issuer: String,
+    control: String,
 }
 
 impl Fixture {
@@ -144,20 +214,25 @@ impl Fixture {
                         let throttled = TcpListener::bind("127.0.0.1:0")
                             .await
                             .expect("bind testkit throttled issuer");
+                        let control = TcpListener::bind("127.0.0.1:0")
+                            .await
+                            .expect("bind testkit chirp control");
                         let urls = (
                             live.issuer().to_owned(),
                             format!("http://{}", throttled.local_addr().expect("throttled addr")),
+                            format!("http://{}", control.local_addr().expect("control addr")),
                         );
                         sender.send(urls).expect("testkit fixture caller went away");
-                        serve_throttled(throttled).await;
+                        tokio::join!(serve_throttled(throttled), serve_control(control));
                     });
                 })
                 .expect("spawn testkit fixture thread");
-            let (issuer, throttled_issuer) =
+            let (issuer, throttled_issuer, control) =
                 receiver.recv().expect("testkit fixture failed to start");
             Fixture {
                 issuer,
                 throttled_issuer,
+                control,
             }
         })
     }
@@ -179,6 +254,31 @@ impl Fixture {
     pub fn throttled_issuer(&self) -> &str {
         &self.throttled_issuer
     }
+
+    /// A [`RootResolver`] asking the fixture's chirp control stand-in, which
+    /// resolves subs by [`root_for_sub`]. Put it in a production [`Policy`]
+    /// beside [`Self::issuer`].
+    ///
+    /// [`Policy`]: crate::Policy
+    pub fn root_resolver(&self) -> RootResolver {
+        resolver_at(&self.control)
+    }
+
+    /// A [`RootResolver`] whose chirp is always throttled (429), so every
+    /// resolve is [`Unavailable`](crate::Unavailable): the outage path.
+    pub fn throttled_root_resolver(&self) -> RootResolver {
+        resolver_at(&self.throttled_issuer)
+    }
+}
+
+fn resolver_at(base_url: &str) -> RootResolver {
+    let minter = MachineTokenMinter::new(MintConfig::new(
+        base_url,
+        "cs_testkit_service",
+        "testkit-secret",
+    ));
+    RootResolver::new(base_url, Arc::new(minter), reqwest::Client::new())
+        .expect("the testkit's chirp URL is an http URL")
 }
 
 /// An id_token with the header ChirpAuth stamps on one, signed by the testkit
@@ -279,6 +379,15 @@ mod tests {
             }
             other => panic!("expected Machine, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn root_for_sub_follows_its_documented_convention() {
+        assert_eq!(root_for_sub("sub_alice").as_deref(), Some("usr_alice"));
+        assert_eq!(root_for_sub("sub_alice.rp2").as_deref(), Some("usr_alice"));
+        assert_eq!(root_for_sub("sub_noroot_system"), None);
+        assert_eq!(root_for_sub("usr_alice"), None);
+        assert_eq!(root_for_sub("sub_.rp2"), None);
     }
 
     /// A token whose signature the testkit JWKS does not hold is rejected:

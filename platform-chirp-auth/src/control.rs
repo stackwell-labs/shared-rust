@@ -29,6 +29,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chirp_auth_client::mint::{MachineTokenMinter, MintError};
 use platform_http_error::ApiError;
@@ -45,6 +46,14 @@ pub const OPERATOR_INTROSPECT_PATH: &str = "/operator/introspect";
 /// [`RootResolver::root_of`]'s cache is cleared when it reaches this many
 /// entries, bounding a long-lived instance's memory.
 pub const ROOT_CACHE_MAX: usize = 10_000;
+
+/// How long the [`Authenticator`](crate::Authenticator) keeps chirp's
+/// `no_root_for_sub` for a sub a verified token carried. Such a sub never gains
+/// a root (it is a system-owned machine's owner, or an erased account), so the
+/// answer is kept to spare chirp a call per request; the bound only covers a
+/// read that ran ahead of chirp's index (a just-created account), which then
+/// heals within this long.
+pub const NO_ROOT_TTL: Duration = Duration::from_secs(60);
 
 /// The chirp control route could not give an answer. The reason names the
 /// failure (a status code, a mint rejection, a malformed body) and never holds
@@ -188,9 +197,27 @@ pub struct Resolved {
 pub struct RootResolver {
     caller: MachineCaller,
     /// sub -> root. A sub's root never changes (chirp never re-points a sub),
-    /// so a positive answer can be kept for the instance's life. Negative
-    /// answers are not kept: a sub with no root yet may be indexed later.
-    cache: Arc<Mutex<HashMap<PairwiseSub, RootId>>>,
+    /// so a positive answer can be kept for the instance's life. A negative
+    /// answer is kept only for a verified token's sub, for [`NO_ROOT_TTL`]
+    /// (see [`Self::person_root`]), and [`Self::root_of`] never reads one: a
+    /// sub from anywhere else may have no root yet and be indexed later.
+    cache: Arc<Mutex<HashMap<PairwiseSub, Cached>>>,
+}
+
+#[derive(Clone)]
+enum Cached {
+    Root(RootId),
+    /// chirp answered `no_root_for_sub` at this instant.
+    NoRoot(Instant),
+}
+
+/// Names the chirp it asks, never the minter's credentials.
+impl fmt::Debug for RootResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RootResolver")
+            .field("base_url", &self.caller.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RootResolver {
@@ -251,13 +278,34 @@ impl RootResolver {
     /// per-request owner-keying path, where only the root matters and a chirp
     /// round trip per request would be the added latency.
     pub async fn root_of(&self, sub: &PairwiseSub) -> Result<Option<RootId>, Unavailable> {
-        if let Some(root) = self.cached(sub) {
+        if let Some(Cached::Root(root)) = self.cached(sub) {
             return Ok(Some(root));
         }
         Ok(self.resolve(sub).await?.map(|r| r.root))
     }
 
-    fn cached(&self, sub: &PairwiseSub) -> Option<RootId> {
+    /// [`Self::root_of`] for a sub a chirp token this service verified carried
+    /// (the caller's, or a machine's owner's): the Authenticator's path. It
+    /// also keeps a `no_root_for_sub` answer for [`NO_ROOT_TTL`], since such a
+    /// sub never gains a root and a system-owned machine would otherwise cost
+    /// a chirp call on every request.
+    pub(crate) async fn person_root(
+        &self,
+        sub: &PairwiseSub,
+    ) -> Result<Option<RootId>, Unavailable> {
+        match self.cached(sub) {
+            Some(Cached::Root(root)) => return Ok(Some(root)),
+            Some(Cached::NoRoot(at)) if at.elapsed() < NO_ROOT_TTL => return Ok(None),
+            _ => {}
+        }
+        let root = self.resolve(sub).await?.map(|r| r.root);
+        if root.is_none() {
+            self.insert(sub, Cached::NoRoot(Instant::now()));
+        }
+        Ok(root)
+    }
+
+    fn cached(&self, sub: &PairwiseSub) -> Option<Cached> {
         // A poisoned lock only means another request panicked mid-insert; the
         // map is still a valid cache, so read through it.
         let cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -265,11 +313,15 @@ impl RootResolver {
     }
 
     fn remember(&self, sub: &PairwiseSub, root: &RootId) {
+        self.insert(sub, Cached::Root(root.clone()));
+    }
+
+    fn insert(&self, sub: &PairwiseSub, entry: Cached) {
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         if cache.len() >= ROOT_CACHE_MAX {
             cache.clear();
         }
-        cache.insert(sub.clone(), root.clone());
+        cache.insert(sub.clone(), entry);
     }
 }
 

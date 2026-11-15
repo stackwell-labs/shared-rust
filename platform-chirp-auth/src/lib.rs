@@ -54,7 +54,7 @@ pub use chirp_auth_client::{verify_chirp_event, ChirpEvent, EventRejection};
 
 /// The pairwise-sub and root-id types (shared-rust#5).
 pub mod ids;
-pub use ids::{InvalidId, PairwiseSub, RootId};
+pub use ids::{ActingFor, InvalidId, PairwiseSub, PersonId, RootId};
 
 /// Machine-token clients for chirp's root-for-sub and operator-introspect
 /// routes (shared-rust#5).

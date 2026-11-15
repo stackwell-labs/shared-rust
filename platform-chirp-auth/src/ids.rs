@@ -156,6 +156,58 @@ chirp_id!(
     "usr_"
 );
 
+/// Which person a request is about, decided once by the
+/// [`Authenticator`](crate::Authenticator) (shared-rust#41, the
+/// agent-platform--protocols `docs/adr-one-person-id.md` decision). A service
+/// keys and compares people by it with `==` and never resolves a sub itself.
+///
+/// - [`PersonId::Root`]: on the production plane, the chirp root account the
+///   caller's pairwise sub resolved to. One person is one `Root` at every
+///   service, whichever client's sub reached it.
+/// - [`PersonId::Test`]: on a test tenant's plane, the test sub as the token
+///   carried it. Never resolved (a test tenant has no root accounts). The
+///   tenant is part of the id because every tenant may mint any test sub, so
+///   tenant `a`'s `test:alice` and tenant `b`'s are two people.
+///
+/// It has no serde impls on purpose: the root never leaves a service on the
+/// wire. A store keys by [`PersonId::as_str`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PersonId {
+    /// A production person: their chirp root.
+    Root(RootId),
+    /// A test tenant's person: the tenant and the sub its token named.
+    Test { tenant: String, sub: String },
+}
+
+impl PersonId {
+    /// The id as a storage key: the root (`usr_…`), or a test person's sub.
+    /// Unique within one plane, which is all a key needs, since each plane has
+    /// its own store. Compare whole `PersonId`s, not keys, across planes.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Root(root) => root.as_str(),
+            Self::Test { sub, .. } => sub,
+        }
+    }
+}
+
+impl fmt::Display for PersonId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The person a request says it acts for, from its `x-user-id` header
+/// ([`USER_ID_HEADER`](crate::USER_ID_HEADER)), resolved the same way the
+/// caller's own [`PersonId`] is
+/// ([`Authenticator::acting_for`](crate::Authenticator::acting_for)).
+///
+/// A claim, not a permission: the header is the caller's word. Act on it only
+/// once a grant says this caller may act for this person. It is its own type so
+/// it cannot be passed where the authenticated caller's person belongs.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ActingFor(pub PersonId);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +262,20 @@ mod tests {
         assert_eq!(back, root);
         assert!(serde_json::from_str::<RootId>("\"sub_abc\"").is_err());
         assert!(serde_json::from_str::<PairwiseSub>("\"usr_abc\"").is_err());
+    }
+
+    #[test]
+    fn a_person_id_keys_by_its_root_or_test_sub_and_compares_whole() {
+        let root = PersonId::Root(RootId::parse("usr_a").unwrap());
+        assert_eq!(root.as_str(), "usr_a");
+        let at = |tenant: &str| PersonId::Test {
+            tenant: tenant.to_owned(),
+            sub: "test:a".to_owned(),
+        };
+        assert_eq!(at("t1").to_string(), "test:a");
+        // Same key on two planes, two people.
+        assert_eq!(at("t1").as_str(), at("t2").as_str());
+        assert_ne!(at("t1"), at("t2"));
     }
 
     #[test]

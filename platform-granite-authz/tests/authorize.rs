@@ -6,7 +6,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use http::HeaderMap;
 use platform_chirp_auth::mint::{MachineTokenMinter, MintConfig};
-use platform_chirp_auth::{Authenticated, Caller, Plane};
+use platform_chirp_auth::{Authenticated, Caller, PersonId, Plane, RootId};
 use platform_granite_authz::{Denied, GraniteAuthz, Refusal};
 use platform_http_error::ApiError;
 use wiremock::matchers::{body_json, header, method, path};
@@ -26,6 +26,7 @@ fn machine() -> Authenticated {
             client_id: "cs_live_cg".to_owned(),
         },
         plane: Plane::Prod,
+        person: Some(PersonId::Root(RootId::parse("usr_owner").unwrap())),
     }
 }
 
@@ -435,6 +436,7 @@ async fn refusals_before_granite_is_asked() {
             client_id: "cs_test_rp".to_owned(),
         },
         plane: Plane::Prod,
+        person: Some(PersonId::Root(RootId::parse("usr_alice").unwrap())),
     };
     let cases: [(&Authenticated, HeaderMap, Denied); 6] = [
         (&person, presenting_grant(), Denied::NotAMachine),

@@ -1,6 +1,6 @@
 [package]
 name = "platform-granite-authz"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -17,6 +17,12 @@ description = "The one Granite authoriser: verify the caller's x-approval-grant 
 # 0.3.0 (repo tag v0.14.0) changes no code: its API takes platform-chirp-auth
 # 0.10's `Authenticated`, whose `Caller` is chirp-auth-client v0.19's
 # (shared-rust#40), so it moves with that breaking release.
+#
+# 0.4.0 (repo tag v0.15.0) changes no code: its API takes platform-chirp-auth
+# 0.11's `Authenticated`, which gains `person` (shared-rust#41), so it moves
+# with that breaking release. `on_behalf_of` stays the caller's `x-user-id`
+# as sent, the pairwise sub Granite binds, until granite#178 keys Granite by
+# PersonId.
 [dependencies]
 base64 = { workspace = true }
 http = { workspace = true }

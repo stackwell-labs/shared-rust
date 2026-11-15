@@ -8,13 +8,15 @@ use axum::extract::State;
 use axum::routing::get;
 use axum::Router;
 use http::{HeaderMap, Request, StatusCode};
+use platform_chirp_auth::mint::{MachineTokenMinter, MintConfig};
 use platform_chirp_auth::testkit::{
-    mint_human_id_token, mint_machine_id_token, mint_test_id_token, Fixture, TestSigningKey,
-    TEST_KID,
+    mint_human_id_token, mint_machine_id_token, mint_test_id_token, root_for_sub, Fixture,
+    TestSigningKey, TEST_KID,
 };
 use platform_chirp_auth::{
-    env, AllowlistUnavailable, AuthFailure, Authenticated, Authenticator, Caller, MachineAllowlist,
-    Machines, Plane, Policy, ID_TOKEN_TYP,
+    env, environment_from_issuer, ActingFor, AllowlistUnavailable, AuthFailure, Authenticated,
+    Authenticator, Caller, MachineAllowlist, Machines, PersonId, Plane, Policy, RootId,
+    RootResolver, ID_TOKEN_TYP,
 };
 use tower::ServiceExt as _;
 
@@ -25,12 +27,30 @@ fn set(items: &[&str]) -> BTreeSet<String> {
     items.iter().map(|item| (*item).to_owned()).collect()
 }
 
+/// A policy for `issuer`, with the fixture's root resolver when the issuer is
+/// production's (a test tenant's issuer takes none).
 fn policy(issuer: &str, machines: Machines, test_tenants: Option<&[&str]>) -> Policy {
     Policy {
         issuer: issuer.to_owned(),
         humans: Some(set(&[RP])),
         machines,
         test_tenants: test_tenants.map(set),
+        resolver: prod_resolver(issuer),
+    }
+}
+
+fn prod_resolver(issuer: &str) -> Option<RootResolver> {
+    (environment_from_issuer(issuer) == Plane::Prod).then(|| Fixture::global().root_resolver())
+}
+
+fn root(id: &str) -> PersonId {
+    PersonId::Root(RootId::parse(id).unwrap())
+}
+
+fn test_person(tenant: &str, sub: &str) -> PersonId {
+    PersonId::Test {
+        tenant: tenant.to_owned(),
+        sub: sub.to_owned(),
     }
 }
 
@@ -45,8 +65,22 @@ fn test_plane(tenant: &str) -> Plane {
     }
 }
 
+/// `caller` verified on `plane`, as the person the fixture's resolver gives
+/// them (a machine: its owner).
 fn on(plane: Plane, caller: Caller) -> Result<Authenticated, AuthFailure> {
-    Ok(Authenticated { caller, plane })
+    let sub = match &caller {
+        Caller::Human { sub, .. } => sub,
+        Caller::Machine { owner_sub, .. } => owner_sub,
+    };
+    let person = match &plane {
+        Plane::Prod => root_for_sub(sub).map(|r| root(&r)),
+        Plane::Test { tenant } => Some(test_person(tenant, sub)),
+    };
+    Ok(Authenticated {
+        caller,
+        plane,
+        person,
+    })
 }
 
 fn human(sub: &str) -> Caller {
@@ -145,6 +179,7 @@ async fn a_person_carries_the_client_their_token_was_for() {
         humans: Some(set(&[RP, "cs_test_rp2"])),
         machines: Machines::None,
         test_tenants: Some(set(&["tenant1"])),
+        resolver: Some(fixture.root_resolver()),
     })
     .unwrap();
 
@@ -173,6 +208,7 @@ async fn a_person_naming_two_accepted_clients_is_401() {
         humans: Some(set(&[RP, "cs_test_rp2"])),
         machines: Machines::None,
         test_tenants: None,
+        resolver: Some(fixture.root_resolver()),
     })
     .unwrap();
     let mint = |aud: serde_json::Value| {
@@ -280,6 +316,9 @@ async fn two_tenants_test_alice_resolve_to_different_planes() {
     assert_eq!(acme.caller, globex.caller);
     assert_eq!(acme.plane, test_plane("acme"));
     assert_eq!(globex.plane, test_plane("globex"));
+    // And two people: the tenant is part of a test PersonId.
+    assert_eq!(acme.person, Some(test_person("acme", "test:alice")));
+    assert_ne!(acme.person, globex.person);
 }
 
 /// A deployment whose issuer is one test tenant's serves only that plane: its
@@ -370,7 +409,8 @@ async fn a_test_keyset_machine_is_on_its_tenants_plane() {
         listed.verify(&agent).await,
         Ok(Authenticated {
             caller: Caller::Machine { .. },
-            plane: Plane::Test { .. }
+            plane: Plane::Test { .. },
+            ..
         })
     ));
     // Undeclared, the allowlist is never asked: an outage there can't turn a
@@ -486,6 +526,21 @@ fn policies_that_cannot_be_served_are_refused() {
         humans: None,
         ..policy(issuer, Machines::None, None)
     });
+    // shared-rust#41: production callers are always resolved, so a production
+    // issuer without a resolver stops boot, not the first request.
+    refused(Policy {
+        resolver: None,
+        ..policy(issuer, Machines::None, None)
+    });
+    refused(Policy {
+        resolver: None,
+        ..policy(issuer, Machines::None, Some(&["t1"]))
+    });
+    // A test tenant's issuer resolves nobody, so a resolver there is a mistake.
+    refused(Policy {
+        resolver: Some(Fixture::global().root_resolver()),
+        ..policy("https://signin.example/test/t1", Machines::None, None)
+    });
 }
 
 #[test]
@@ -526,10 +581,15 @@ impl axum::extract::FromRef<AppState> for Authenticator {
 }
 
 async fn whoami(
-    Authenticated { caller, plane }: Authenticated,
+    Authenticated {
+        caller,
+        plane,
+        person,
+    }: Authenticated,
     State(_): State<AppState>,
 ) -> String {
-    format!("{} on {plane}", caller.sub())
+    let person = person.map_or("nobody".to_owned(), |p| p.to_string());
+    format!("{} as {person} on {plane}", caller.sub())
 }
 
 async fn status_of(app: Router, token: Option<&str>) -> (StatusCode, String) {
@@ -562,10 +622,16 @@ async fn the_extractor_answers_200_401_and_503() {
     let token = mint_human_id_token(fixture.issuer(), RP, "sub_alice");
     assert_eq!(
         status_of(app(fixture.issuer()), Some(&token)).await,
-        (StatusCode::OK, "sub_alice on prod".to_owned())
+        (StatusCode::OK, "sub_alice as usr_alice on prod".to_owned())
     );
     assert_eq!(
         status_of(app(fixture.issuer()), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    // A verified person chirp has no account for.
+    let token = mint_human_id_token(fixture.issuer(), RP, "sub_noroot_gone");
+    assert_eq!(
+        status_of(app(fixture.issuer()), Some(&token)).await.0,
         StatusCode::UNAUTHORIZED
     );
 
@@ -575,5 +641,324 @@ async fn the_extractor_answers_200_401_and_503() {
             .await
             .0,
         StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+// ---- PersonId (shared-rust#41) ----------------------------------------------
+
+/// One person is one `PersonId::Root` whichever client's pairwise sub reached
+/// the service; a test person is their sub on their tenant's plane, never
+/// resolved.
+#[tokio::test]
+async fn a_person_is_their_root_whichever_client_their_sub_is_for() {
+    let fixture = Fixture::global();
+    let auth = Authenticator::new(Policy {
+        humans: Some(set(&[RP, "cs_test_rp2"])),
+        ..policy(fixture.issuer(), Machines::None, Some(&["tenant1"]))
+    })
+    .unwrap();
+
+    let at_rp = auth
+        .verify(&mint_human_id_token(fixture.issuer(), RP, "sub_alice"))
+        .await
+        .unwrap();
+    let at_rp2 = auth
+        .verify(&mint_human_id_token(
+            fixture.issuer(),
+            "cs_test_rp2",
+            "sub_alice.rp2",
+        ))
+        .await
+        .unwrap();
+    assert_ne!(at_rp.caller, at_rp2.caller);
+    assert_eq!(at_rp.person, Some(root("usr_alice")));
+    assert_eq!(at_rp.person, at_rp2.person);
+
+    let tester = auth
+        .verify(&mint_test_id_token(
+            &fixture.test_issuer("tenant1"),
+            RP,
+            "test:alice",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tester.person, Some(test_person("tenant1", "test:alice")));
+    assert_eq!(tester.person.as_ref().unwrap().as_str(), "test:alice");
+}
+
+/// A machine's person is its owner's. A machine no person owns (chirp
+/// resolves a system-owned client's owner to no account) is admitted as
+/// acting for nobody; a person chirp has no account for is refused.
+#[tokio::test]
+async fn a_machine_is_its_owners_person_and_a_rootless_person_is_refused() {
+    let fixture = Fixture::global();
+    let auth = humans_and_agent(fixture.issuer());
+
+    let owned = auth
+        .verify(&mint_machine_id_token(
+            fixture.issuer(),
+            AGENT_CLIENT,
+            "agent_1",
+            "sub_bob.cli",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owned.person, Some(root("usr_bob")));
+
+    let system = auth
+        .verify(&mint_machine_id_token(
+            fixture.issuer(),
+            AGENT_CLIENT,
+            "agent_sys",
+            "sub_noroot_system",
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(system.caller, Caller::Machine { .. }));
+    assert_eq!(system.person, None);
+
+    assert_eq!(
+        auth.verify(&mint_human_id_token(
+            fixture.issuer(),
+            RP,
+            "sub_noroot_gone"
+        ))
+        .await,
+        Err(AuthFailure::NoPerson)
+    );
+    // A production token whose sub is not a pairwise sub names nobody chirp
+    // could resolve.
+    assert_eq!(
+        auth.verify(&mint_human_id_token(fixture.issuer(), RP, "usr_alice"))
+            .await,
+        Err(AuthFailure::Unauthorized)
+    );
+}
+
+/// The resolver's outage is a 503, for a person and for a machine (whose
+/// owner might be a person): never "no root".
+#[tokio::test]
+async fn a_resolver_outage_is_503() {
+    let fixture = Fixture::global();
+    let auth = Authenticator::new(Policy {
+        resolver: Some(fixture.throttled_root_resolver()),
+        ..policy(
+            fixture.issuer(),
+            Machines::Allow(set(&[AGENT_CLIENT])),
+            Some(&["tenant1"]),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        auth.verify(&mint_human_id_token(fixture.issuer(), RP, "sub_alice"))
+            .await,
+        Err(AuthFailure::Unavailable)
+    );
+    assert_eq!(
+        auth.verify(&mint_machine_id_token(
+            fixture.issuer(),
+            AGENT_CLIENT,
+            "agent_1",
+            "sub_noroot_system",
+        ))
+        .await,
+        Err(AuthFailure::Unavailable)
+    );
+    // A test person is never resolved, so the outage does not reach them.
+    let tester = mint_test_id_token(&fixture.test_issuer("tenant1"), RP, "test:alice");
+    assert!(auth.verify(&tester).await.is_ok());
+}
+
+/// A chirp stand-in whose `/token` mints a token, for a resolver test that
+/// needs to count or shape root-for-sub answers.
+async fn chirp_control() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({ "id_token": "machine.id.token", "expires_in": 3600 }),
+        ))
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn answer_root(
+    server: &wiremock::MockServer,
+    sub: &str,
+    status: u16,
+    body: serde_json::Value,
+    times: u64,
+) {
+    use wiremock::matchers::{body_json, method, path};
+    wiremock::Mock::given(method("POST"))
+        .and(path("/control/root-for-sub"))
+        .and(body_json(serde_json::json!({ "sub": sub })))
+        .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(body))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+fn resolver_at(server: &wiremock::MockServer) -> RootResolver {
+    let minter = MachineTokenMinter::new(MintConfig::new(server.uri(), "cs_svc", "secret"));
+    RootResolver::new(&server.uri(), Arc::new(minter), reqwest::Client::new()).unwrap()
+}
+
+/// Only chirp's `no_root_for_sub` means "no root": any other 404 (a chirp
+/// with the route off) is an outage, so a misconfiguration is loud.
+#[tokio::test]
+async fn only_no_root_for_sub_is_no_root() {
+    let fixture = Fixture::global();
+    let chirp = chirp_control().await;
+    answer_root(
+        &chirp,
+        "sub_alice",
+        404,
+        serde_json::json!({ "error": "not_found" }),
+        1,
+    )
+    .await;
+    answer_root(
+        &chirp,
+        "sub_gone",
+        404,
+        serde_json::json!({ "error": "no_root_for_sub" }),
+        1,
+    )
+    .await;
+    let auth = Authenticator::new(Policy {
+        resolver: Some(resolver_at(&chirp)),
+        ..policy(fixture.issuer(), Machines::None, None)
+    })
+    .unwrap();
+    assert_eq!(
+        auth.verify(&mint_human_id_token(fixture.issuer(), RP, "sub_alice"))
+            .await,
+        Err(AuthFailure::Unavailable)
+    );
+    assert_eq!(
+        auth.verify(&mint_human_id_token(fixture.issuer(), RP, "sub_gone"))
+            .await,
+        Err(AuthFailure::NoPerson)
+    );
+}
+
+/// One cached resolver: a person's root is asked for once per instance, and
+/// a system machine's "no root" is kept too, so neither costs a chirp call
+/// per request. Clones of the Authenticator share the cache.
+#[tokio::test]
+async fn the_resolver_is_asked_once_per_sub() {
+    let fixture = Fixture::global();
+    let chirp = chirp_control().await;
+    answer_root(
+        &chirp,
+        "sub_alice",
+        200,
+        serde_json::json!({ "root_id": "usr_alice", "current": true }),
+        1,
+    )
+    .await;
+    answer_root(
+        &chirp,
+        "sub_system",
+        404,
+        serde_json::json!({ "error": "no_root_for_sub" }),
+        1,
+    )
+    .await;
+    let auth = Authenticator::new(Policy {
+        resolver: Some(resolver_at(&chirp)),
+        ..policy(
+            fixture.issuer(),
+            Machines::Allow(set(&[AGENT_CLIENT])),
+            None,
+        )
+    })
+    .unwrap();
+    let person = mint_human_id_token(fixture.issuer(), RP, "sub_alice");
+    let system = mint_machine_id_token(fixture.issuer(), AGENT_CLIENT, "agent_s", "sub_system");
+    for auth in [auth.clone(), auth] {
+        assert_eq!(
+            auth.verify(&person).await.unwrap().person,
+            Some(root("usr_alice"))
+        );
+        assert_eq!(auth.verify(&system).await.unwrap().person, None);
+    }
+    // `expect(1)` on each answer is checked when `chirp` drops.
+}
+
+fn with_user_id(value: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-user-id", value.parse().unwrap());
+    headers
+}
+
+/// `x-user-id` becomes an `ActingFor`, resolved on the request's plane the
+/// same way the caller is.
+#[tokio::test]
+async fn x_user_id_is_acting_for_a_person() {
+    let fixture = Fixture::global();
+    let auth = Authenticator::new(policy(
+        fixture.issuer(),
+        Machines::Allow(set(&[AGENT_CLIENT])),
+        Some(&["tenant1"]),
+    ))
+    .unwrap();
+    let agent = auth
+        .verify(&mint_machine_id_token(
+            fixture.issuer(),
+            AGENT_CLIENT,
+            "agent_1",
+            "sub_noroot_system",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(auth.acting_for(&agent, &HeaderMap::new()).await, Ok(None));
+    assert_eq!(
+        auth.acting_for(&agent, &with_user_id("sub_carol.granite"))
+            .await,
+        Ok(Some(ActingFor(root("usr_carol"))))
+    );
+    // A root on the wire is not a pairwise sub: refused, never trusted as is.
+    assert_eq!(
+        auth.acting_for(&agent, &with_user_id("usr_carol")).await,
+        Err(AuthFailure::Unauthorized)
+    );
+    assert_eq!(
+        auth.acting_for(&agent, &with_user_id("sub_noroot_x")).await,
+        Err(AuthFailure::NoPerson)
+    );
+
+    let test_agent = auth
+        .verify(&mint_machine_id_token(
+            &fixture.test_issuer("tenant1"),
+            AGENT_CLIENT,
+            "agent_t",
+            "test:owner",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        auth.acting_for(&test_agent, &with_user_id("test:carol"))
+            .await,
+        Ok(Some(ActingFor(test_person("tenant1", "test:carol"))))
+    );
+    assert_eq!(
+        auth.acting_for(&test_agent, &with_user_id("test: carol"))
+            .await,
+        Err(AuthFailure::Unauthorized)
+    );
+
+    let down = Authenticator::new(Policy {
+        resolver: Some(fixture.throttled_root_resolver()),
+        ..policy(fixture.issuer(), Machines::Any, None)
+    })
+    .unwrap();
+    assert_eq!(
+        down.acting_for(&agent, &with_user_id("sub_carol")).await,
+        Err(AuthFailure::Unavailable)
     );
 }

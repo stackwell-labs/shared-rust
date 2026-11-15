@@ -39,8 +39,8 @@ Shared chirp-auth request plumbing:
   construction says which humans (audiences), which machines
   (`Machines::None | Allow | Any | Dynamic`) and which test tenants
   (`test_tenants`, each verified at `{issuer}/test/{tenant}`) one deployment
-  serves. `authenticate(&headers)` returns `Authenticated { caller, plane }` or
-  an `AuthFailure`. The `Plane` (`Prod | Test { tenant }`) comes from the keyset
+  serves. `authenticate(&headers)` returns `Authenticated { caller, plane,
+  person }` or an `AuthFailure`. The `Plane` (`Prod | Test { tenant }`) comes from the keyset
   that verified the token and picks the service's store handle; `Caller`
   (`Human { sub, client_id } | Machine { sub, owner_sub, client_id }`,
   chirp-auth-client's own, re-exported) carries no environment, so nothing
@@ -50,6 +50,16 @@ Shared chirp-auth request plumbing:
   token naming two is a 401. `planes()` lists every plane for boot. A
   ChirpAuth outage is a 503,
   never a 401, and a rejected machine token is never retried as a human.
+  `person` is which person the request is about, decided once here
+  (shared-rust#41): `PersonId::Root(RootId)` on Prod, from the one cached
+  `RootResolver` the `Policy` must carry with a production issuer;
+  `PersonId::Test { tenant, sub }` on a test plane, never resolved. A machine's
+  is its owner's (`None` for a system-owned client). Only chirp's `404
+  no_root_for_sub` means no root: a person with none is `AuthFailure::NoPerson`
+  (401), any other resolver failure a 503. Services key and compare people by
+  `PersonId`, never by a sub. `acting_for(&authenticated, &headers)` turns
+  `x-user-id` into an `ActingFor(PersonId)` the same way (a claim: check a
+  grant before acting on it).
   `Authenticated` is the axum extractor (state needs `Authenticator: FromRef<S>`). The `env`
   readers use one naming scheme, `{PREFIX}_CHIRP_ISSUER`,
   `{PREFIX}_HUMAN_AUDIENCES`, `{PREFIX}_MACHINE_CLIENTS`, and a missing or
@@ -60,8 +70,10 @@ Shared chirp-auth request plumbing:
 - `verify_chirp_event` / `ChirpEvent` / `EventRejection` — re-exported from
   `chirp-auth-client`, for a receiver of Chirp's `user.deleted` webhook.
 - `testkit` (feature) — real RS256 tokens, and `Fixture::global()`: a local
-  issuer and a throttled (429) one on a thread that outlives each test's
-  runtime. Built on chirp-auth-client's event-signing kit (`JwksServer`,
+  issuer, a throttled (429) one, and chirp's `/token` + root-for-sub
+  (`root_resolver()`; `sub_{p}` and `sub_{p}.{client}` resolve to `usr_{p}`,
+  `sub_noroot…` to no root; `throttled_root_resolver()` for the outage) on a
+  thread that outlives each test's runtime. Built on chirp-auth-client's event-signing kit (`JwksServer`,
   `TestSigningKey`, `user_deleted_claims`), which it also re-exports for
   webhook tests.
 - `bearer_token` — re-exported from `chirp-auth-client` (RFC-7235 extraction).
